@@ -81,3 +81,25 @@ The database is built on MongoDB, utilizing Mongoose references (`ObjectId`) to 
 ## 5. Extensibility
 
 Because the system avoids hardcoded enums for core workflows (like Statuses, Labels, and Permissions) and relies on reference models, adding features like **Custom Fields**, **Automations**, or **Client Portals** in the future will require minimal structural refactoring.
+
+---
+
+## 6. API Route Modules (RBAC & Tenancy)
+
+The routing architecture is modularized, mapping directly to specific business entities. All endpoints (excluding public auth) evaluate an injected `x-org-id` header via middleware to establish the tenant context before any logic executes.
+
+### `authRoutes` (Public / Registration)
+- **Purpose**: Issues JWTs and handles initial tenant onboarding.
+- **Key Flow**: When registering, it simultaneously creates an `Organisation`, a base `Role` (OWNER), a `User`, and binds them via an `OrganisationMember` join document. The JWT payload returned strictly encodes user identification (and basic info to avoid DB round-trips), not roles.
+
+### `organisationRoutes` (SaaS & Tenant Levels)
+- **SaaS Level (SUPER_ADMIN)**: Routes like `POST /` and `GET /` globally manage instances. They require the wildcard `*` permission, which immediately bypasses all other granular checks in the `requirePermissions` middleware.
+- **Tenant Level**: Routes like `GET /:id` or `PUT /:id` allow a tenant to manage their own specific organisation. The controller enforces that the requested `:id` strictly matches the `req.user.organisation` resolved from their header, preventing cross-tenant leakage.
+
+### `roleRoutes` (Custom RBAC)
+- **Purpose**: Allows tenants to craft custom roles within their organisation.
+- **Key Flow**: Requires `create:role` or `update:role` permissions. When fetching roles, it returns both global default roles (where `organisation: null`) and custom roles scoped to the active tenant.
+
+### `userRoutes` (Membership Management)
+- **Purpose**: Manages `OrganisationMember` links.
+- **Key Flow**: Creating or removing a user under this module does not mutate the core `User` document. Instead, it assigns them to the tenant or sets their membership `status` to `SUSPENDED`, preserving soft-delete tracking. Invoking `PUT /:id/role` securely migrates a user between defined tenant roles.

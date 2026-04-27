@@ -1,4 +1,4 @@
-import { createUser, deleteUser } from '../services/userService.js';
+import { createUser, deleteUser, getUsers, getUserById, updateMemberRole } from '../services/userService.js';
 
 // @desc    Create a new user within the organisation
 // @route   POST /api/users
@@ -18,6 +18,43 @@ export const createUserController = async (req, res, next) => {
             success: true,
             data: result,
         });
+    } catch (error) {
+        next(error);
+    }
+};
+
+export const getUsersController = async (req, res, next) => {
+    try {
+        const orgId = req.user.organisation;
+        if (!orgId) return res.status(400).json({ success: false, error: 'Organisation context required' });
+
+        const users = await getUsers(orgId);
+        res.status(200).json({ success: true, data: users });
+    } catch (error) {
+        next(error);
+    }
+};
+
+export const getUserByIdController = async (req, res, next) => {
+    try {
+        const orgId = req.user.organisation;
+        if (!orgId) return res.status(400).json({ success: false, error: 'Organisation context required' });
+
+        const user = await getUserById(orgId, req.params.id);
+        res.status(200).json({ success: true, data: user });
+    } catch (error) {
+        next(error);
+    }
+};
+
+export const updateMemberRoleController = async (req, res, next) => {
+    try {
+        const orgId = req.user.organisation;
+        if (!orgId) return res.status(400).json({ success: false, error: 'Organisation context required' });
+
+        const { roleId } = req.body;
+        const updatedMember = await updateMemberRole(orgId, req.params.id, roleId);
+        res.status(200).json({ success: true, data: updatedMember });
     } catch (error) {
         next(error);
     }

@@ -10,7 +10,7 @@ const roleSchema = new mongoose.Schema(
         },
         scope: {
             type: String,
-            enum: ['ORGANISATION', 'WORKSPACE'],
+            enum: ['ORGANISATION', 'WORKSPACE', 'SYSTEM'],
             default: 'ORGANISATION',
             required: true,
         },

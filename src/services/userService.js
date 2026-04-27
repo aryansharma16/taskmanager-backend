@@ -66,3 +66,44 @@ export const deleteUser = async (adminOrgId, targetUserId) => {
     
     return true;
 };
+
+export const getUsers = async (orgId) => {
+    const members = await OrganisationMember.find({ organisation: orgId })
+        .populate('user', 'name email profilePic status')
+        .populate('role', 'name permissions isCustom');
+    
+    return members;
+};
+
+export const getUserById = async (orgId, userId) => {
+    const member = await OrganisationMember.findOne({ organisation: orgId, user: userId })
+        .populate('user', 'name email profilePic status')
+        .populate('role', 'name permissions isCustom');
+    
+    if (!member) {
+        throw new Error('User membership not found in this organisation');
+    }
+
+    return member;
+};
+
+export const updateMemberRole = async (orgId, userId, newRoleId) => {
+    const member = await OrganisationMember.findOne({ organisation: orgId, user: userId });
+    if (!member) {
+        throw new Error('User membership not found in this organisation');
+    }
+
+    const newRole = await Role.findOne({
+        _id: newRoleId,
+        $or: [{ organisation: orgId }, { organisation: null }]
+    });
+
+    if (!newRole) {
+        throw new Error('Role not found or invalid for this organisation');
+    }
+
+    member.role = newRole._id;
+    await member.save();
+
+    return member;
+};

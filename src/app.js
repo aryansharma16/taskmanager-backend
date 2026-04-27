@@ -3,6 +3,8 @@ import cors from 'cors';
 import morgan from 'morgan';
 import authRoutes from './routes/authRoutes.js';
 import userRoutes from './routes/userRoutes.js';
+import roleRoutes from './routes/roleRoutes.js';
+import organisationRoutes from './routes/organisationRoutes.js';
 import { errorHandler } from './middleware/errorHandler.js';
 const app = express();
 
@@ -14,6 +16,8 @@ app.use(morgan('dev'));
 // Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/roles', roleRoutes);
+app.use('/api/organisations', organisationRoutes);
 
 // Root Endpoint
 app.get('/', (req, res) => {

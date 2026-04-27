@@ -22,7 +22,11 @@ export const registerTenant = async (orgName, slug, userName, userEmail, userPas
         ownerRole = await Role.create({
             name: 'OWNER',
             scope: 'ORGANISATION',
-            permissions: ['create:user', 'read:user', 'update:user', 'delete:user'],
+            permissions: [
+                'create:user', 'read:user', 'update:user', 'delete:user',
+                'create:role', 'read:role', 'update:role', 'delete:role',
+                'read:org', 'update:org'
+            ],
         });
     }
 
@@ -67,6 +71,15 @@ export const login = async (email, password) => {
     // 4. Sign JWT
     const payload = {
         id: user._id,
+        name: user.name,
+        email: user.email,
+        phoneNumber: user.phoneNumber,
+        organisations: orgMembers.map((member) => ({
+            organisationId: member.organisation._id,
+            name: member.organisation.name,
+            slug: member.organisation.slug,
+            role: member.role.name,
+        })),
     };
 
     const token = jwt.sign(payload, process.env.JWT_SECRET || 'secret123', {
