@@ -42,9 +42,29 @@ The database is built on MongoDB, utilizing Mongoose references (`ObjectId`) to 
 
 ### Workspace Layer
 
-- **`Workspace`**: Represents a project, team, or department within an `Organisation`. This acts as a silo for tasks and statuses.
-- **`WorkspaceMember`**: A join table (mapping) between `User` and `Workspace`. 
+- **`Workspace`**: Represents a project, team, or department within an `Organisation`. This acts as a silo for tasks and statuses. Soft-deletable via `isActive` + `archivedAt`. Carries a `slug` (URL-friendly, unique per org) and a `createdBy` ref for auditing.
+- **`WorkspaceMember`**: A join table (mapping) between `User` and `Workspace`.
   - **Why this model?** A user might be part of an organisation but not necessarily part of every workspace. This model tracks *which* users are in *which* workspaces. It references the `Role` model directly to unify the RBAC engine for both workspace-level and org-level permissions.
+  - Carries a `status` enum (`ACTIVE | SUSPENDED | INVITED`) and `addedBy` ref, mirroring `OrganisationMember` for a consistent invite/suspend story.
+
+#### Workspace RBAC — Hybrid model
+
+Workspace endpoints use a **hybrid** permission model, layered over the
+org-level RBAC already enforced by `requirePermissions`:
+
+1. If the requester's **org-level** role contains `*` (super admin) or
+   `manage:workspace`, they bypass workspace checks entirely. Org
+   Owners/Admins can therefore act on any workspace in the tenant
+   without being added as a member.
+2. Otherwise, an `ACTIVE` `WorkspaceMember` is required, and the
+   member's `Role.permissions` must grant every required workspace
+   permission for the action.
+
+The two new middlewares in
+[src/middleware/workspaceMiddleware.js](src/middleware/workspaceMiddleware.js)
+(`requireWorkspaceContext`, `requireWorkspacePermissions`) implement
+this. Full details, edge-case matrix, and API reference live in
+[docs/WORKSPACE_LAYER.md](docs/WORKSPACE_LAYER.md).
 
 ### Task Engine
 

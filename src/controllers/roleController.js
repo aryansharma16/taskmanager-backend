@@ -14,7 +14,7 @@ export const createRoleController = async (req, res, next) => {
         const orgId = requireOrg(req, res);
         if (!orgId) return;
 
-        const { name, permissions, description } = req.body || {};
+        const { name, permissions, description, scope } = req.body || {};
 
         if (typeof name !== 'string' || !name.trim()) {
             return res.status(400).json({ success: false, error: 'Role name is required' });
@@ -32,6 +32,7 @@ export const createRoleController = async (req, res, next) => {
             permissions,
             description,
             req.user?._id,
+            scope,
         );
         res.status(201).json({ success: true, data: role });
     } catch (error) {
@@ -44,7 +45,7 @@ export const getRolesController = async (req, res, next) => {
         const orgId = requireOrg(req, res);
         if (!orgId) return;
 
-        const roles = await roleService.getRoles(orgId);
+        const roles = await roleService.getRoles(orgId, { scope: req.query.scope });
         res.status(200).json({ success: true, data: roles });
     } catch (error) {
         next(error);
@@ -68,7 +69,7 @@ export const updateRoleController = async (req, res, next) => {
         const orgId = requireOrg(req, res);
         if (!orgId) return;
 
-        const { permissions, description } = req.body || {};
+        const { name, scope, permissions, description } = req.body || {};
 
         if (permissions !== undefined && !Array.isArray(permissions)) {
             return res.status(400).json({
@@ -80,8 +81,7 @@ export const updateRoleController = async (req, res, next) => {
         const role = await roleService.updateRole(
             orgId,
             req.params.id,
-            permissions,
-            description,
+            { name, scope, permissions, description },
             req.user?._id,
         );
         res.status(200).json({ success: true, data: role });

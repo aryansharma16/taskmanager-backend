@@ -67,7 +67,30 @@ A robust, multi-tenant B2B SaaS backend built with Node.js, Express, and MongoDB
 
 ### Users (Requires Auth & Permissions)
 - `POST /api/users` - Create a new user within the current organisation (Requires `create:user` permission).
-- `DELETE /api/users/:id` - Delete a user (Requires `delete:user` permission).
+- `GET /api/users` - List members of the current organisation.
+- `GET /api/users/:id` - Fetch a member by `OrganisationMember._id` or `User._id`.
+- `PUT /api/users/:id/role` - Change a member's role.
+- `DELETE /api/users/:id` - Remove a member from the organisation (Requires `delete:user` permission).
+
+### Roles (Requires Auth & Permissions)
+- `POST /api/roles` - Create a custom role. Body supports `scope: 'ORGANISATION' | 'WORKSPACE'` (default `ORGANISATION`).
+- `GET /api/roles?scope=WORKSPACE` - List roles, optionally filtered by scope.
+- `GET /api/roles/:id` - Fetch a role.
+- `PUT /api/roles/:id` - Update a custom role's permissions/description.
+- `DELETE /api/roles/:id` - Delete a custom role (rejected if any member still uses it).
+
+### Workspaces (Requires Auth & Permissions)
+See [docs/WORKSPACE_LAYER.md](docs/WORKSPACE_LAYER.md) for the full
+reference, including the hybrid permission model and edge-case matrix.
+
+- `POST /api/workspaces` - Create a workspace. The creator picks their own workspace-scoped role and may add initial members.
+- `GET /api/workspaces` - List workspaces (paginated; only workspaces you're a member of unless you have `*` or `manage:workspace`).
+- `GET /api/workspaces/:id` - Fetch a workspace with member count.
+- `PUT /api/workspaces/:id` - Rename / re-slug / edit description.
+- `DELETE /api/workspaces/:id` - Archive (soft-delete).
+- `PATCH /api/workspaces/:id/restore` - Restore an archived workspace.
+- `GET|POST /api/workspaces/:id/members` - List or add members.
+- `PUT|DELETE /api/workspaces/:id/members/:memberId` - Change role or remove member.
 
 ## Project Structure
 

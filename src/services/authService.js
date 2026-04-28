@@ -16,16 +16,25 @@ export const registerTenant = async (orgName, slug, userName, userEmail, userPas
     // 2. Create Organisation
     const organisation = await Organisation.create({ name: orgName, slug });
 
-    // 3. Ensure 'OWNER' role exists
+    // 3. Ensure 'OWNER' role exists with the full set of org-level perms,
+    //    including the workspace bypass perms used by the hybrid RBAC
+    //    model. An OWNER can act on any workspace within the org without
+    //    being an explicit WorkspaceMember.
     let ownerRole = await Role.findOne({ name: 'OWNER', scope: 'ORGANISATION' });
     if (!ownerRole) {
         ownerRole = await Role.create({
             name: 'OWNER',
             scope: 'ORGANISATION',
             permissions: [
+                // User management
                 'create:user', 'read:user', 'update:user', 'delete:user',
+                // Role management
                 'create:role', 'read:role', 'update:role', 'delete:role',
-                'read:org', 'update:org'
+                // Org management
+                'read:org', 'update:org',
+                // Workspace management (org level + bypass)
+                'create:workspace', 'read:workspace', 'update:workspace', 'delete:workspace',
+                'manage:workspace', 'manage:workspace_members',
             ],
         });
     }
