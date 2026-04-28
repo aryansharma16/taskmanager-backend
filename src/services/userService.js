@@ -1,85 +1,135 @@
 import bcrypt from 'bcryptjs';
+import mongoose from 'mongoose';
 import User from '../models/User.js';
 import Role from '../models/Role.js';
 import OrganisationMember from '../models/OrganisationMember.js';
 
-export const createUser = async (adminOrgId, name, email, password, roleName = 'MEMBER') => {
-    // 1. Check if user already exists
-    let user = await User.findOne({ email });
+const isObjectId = (v) => mongoose.isValidObjectId(v);
 
-    // 2. Get role
-    let role = await Role.findOne({ name: roleName.toUpperCase(), organisation: adminOrgId });
-    if (!role) {
-        role = await Role.findOne({ name: roleName.toUpperCase(), organisation: null }); // Fallback to global role if exists
+// Build a query that resolves ":id" in /api/users/:id to either the
+// OrganisationMember._id (what `getUsers` returns to the client) or the
+// underlying User._id, scoped to the caller's organisation.
+const buildMemberQuery = (orgId, id) => {
+    if (!isObjectId(id)) return null;
+    return {
+        organisation: orgId,
+        $or: [{ _id: id }, { user: id }],
+    };
+};
+
+const findRoleForOrg = async (orgId, roleId) => {
+    if (!isObjectId(roleId)) return null;
+    return Role.findOne({
+        _id: roleId,
+        $or: [{ organisation: orgId }, { organisation: null }],
+    });
+};
+
+export const createUser = async (adminOrgId, name, email, password, roleId) => {
+    if (!name || !email || !password) {
+        throw new Error('name, email and password are required');
     }
-    if (!role) {
-        // Fallback create basic member role if not exists globally or locally
-        role = await Role.create({
-            name: 'MEMBER',
-            scope: 'ORGANISATION',
-            permissions: ['read:user'],
-        });
+    if (!roleId) {
+        throw new Error('roleId is required. Create a role first, then assign it.');
     }
+    if (!isObjectId(roleId)) {
+        throw new Error('Invalid roleId');
+    }
+
+    const role = await findRoleForOrg(adminOrgId, roleId);
+    if (!role) {
+        throw new Error('Role not found or invalid for this organisation');
+    }
+
+    // Email is normalised by the schema, but normalise here too so the
+    // existing-user lookup is consistent regardless of casing/whitespace.
+    const normalisedEmail = String(email).trim().toLowerCase();
+
+    let user = await User.findOne({ email: normalisedEmail });
+    let createdNewUser = false;
 
     if (user) {
-        // User exists, check if already in organisation
-        const existingMember = await OrganisationMember.findOne({ user: user._id, organisation: adminOrgId });
+        const existingMember = await OrganisationMember.findOne({
+            user: user._id,
+            organisation: adminOrgId,
+        });
         if (existingMember) {
             throw new Error('User is already a member of this organisation');
         }
     } else {
-        // 3. Hash password and create user
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
 
         user = await User.create({
             name,
-            email,
+            email: normalisedEmail,
             password: hashedPassword,
         });
+        createdNewUser = true;
     }
 
-    // 4. Add user to organisation
-    const orgMember = await OrganisationMember.create({
-        user: user._id,
-        organisation: adminOrgId,
-        role: role._id,
-    });
+    // If membership creation fails (e.g. unique-index race or validation),
+    // roll back the User we just created to avoid orphaning it.
+    let orgMember;
+    try {
+        orgMember = await OrganisationMember.create({
+            user: user._id,
+            organisation: adminOrgId,
+            role: role._id,
+        });
+    } catch (err) {
+        if (createdNewUser) {
+            await User.deleteOne({ _id: user._id }).catch(() => {});
+        }
+        throw err;
+    }
 
-    // Remove password from returned object
     const createdUser = user.toObject();
     delete createdUser.password;
 
-    return { user: createdUser, membership: orgMember };
+    return { user: createdUser, membership: orgMember, alreadyExisted: !createdNewUser };
 };
 
-export const deleteUser = async (adminOrgId, targetUserId) => {
-    // 1. Find membership
-    const orgMember = await OrganisationMember.findOne({ user: targetUserId, organisation: adminOrgId });
+export const deleteUser = async (adminOrgId, targetId, requestingUserId) => {
+    const query = buildMemberQuery(adminOrgId, targetId);
+    const orgMember = query ? await OrganisationMember.findOne(query) : null;
     if (!orgMember) {
         throw new Error('User is not a member of this organisation');
     }
 
-    // 2. Suspend or remove user from organisation instead of deleting the User entirely
-    orgMember.status = 'SUSPENDED';
-    await orgMember.save();
-    
+    if (
+        requestingUserId &&
+        orgMember.user.toString() === requestingUserId.toString()
+    ) {
+        throw new Error('You cannot remove yourself from the organisation');
+    }
+
+    // Hard-remove the membership; the underlying User stays so the same
+    // person can belong to / be re-added to other organisations.
+    await OrganisationMember.deleteOne({ _id: orgMember._id });
+
     return true;
 };
 
 export const getUsers = async (orgId) => {
-    const members = await OrganisationMember.find({ organisation: orgId })
+    const members = await OrganisationMember.find({
+        organisation: orgId,
+        status: { $ne: 'SUSPENDED' },
+    })
         .populate('user', 'name email profilePic status')
         .populate('role', 'name permissions isCustom');
-    
+
     return members;
 };
 
-export const getUserById = async (orgId, userId) => {
-    const member = await OrganisationMember.findOne({ organisation: orgId, user: userId })
-        .populate('user', 'name email profilePic status')
-        .populate('role', 'name permissions isCustom');
-    
+export const getUserById = async (orgId, id) => {
+    const query = buildMemberQuery(orgId, id);
+    const member = query
+        ? await OrganisationMember.findOne(query)
+            .populate('user', 'name email profilePic status')
+            .populate('role', 'name permissions isCustom')
+        : null;
+
     if (!member) {
         throw new Error('User membership not found in this organisation');
     }
@@ -87,17 +137,21 @@ export const getUserById = async (orgId, userId) => {
     return member;
 };
 
-export const updateMemberRole = async (orgId, userId, newRoleId) => {
-    const member = await OrganisationMember.findOne({ organisation: orgId, user: userId });
+export const updateMemberRole = async (orgId, id, newRoleId) => {
+    if (!newRoleId) {
+        throw new Error('roleId is required');
+    }
+    if (!isObjectId(newRoleId)) {
+        throw new Error('Invalid roleId');
+    }
+
+    const query = buildMemberQuery(orgId, id);
+    const member = query ? await OrganisationMember.findOne(query) : null;
     if (!member) {
         throw new Error('User membership not found in this organisation');
     }
 
-    const newRole = await Role.findOne({
-        _id: newRoleId,
-        $or: [{ organisation: orgId }, { organisation: null }]
-    });
-
+    const newRole = await findRoleForOrg(orgId, newRoleId);
     if (!newRole) {
         throw new Error('Role not found or invalid for this organisation');
     }
