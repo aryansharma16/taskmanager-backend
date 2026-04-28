@@ -26,7 +26,13 @@ export const createRoleController = async (req, res, next) => {
             });
         }
 
-        const role = await roleService.createRole(orgId, name, permissions, description);
+        const role = await roleService.createRole(
+            orgId,
+            name,
+            permissions,
+            description,
+            req.user?._id,
+        );
         res.status(201).json({ success: true, data: role });
     } catch (error) {
         next(error);
@@ -71,7 +77,13 @@ export const updateRoleController = async (req, res, next) => {
             });
         }
 
-        const role = await roleService.updateRole(orgId, req.params.id, permissions, description);
+        const role = await roleService.updateRole(
+            orgId,
+            req.params.id,
+            permissions,
+            description,
+            req.user?._id,
+        );
         res.status(200).json({ success: true, data: role });
     } catch (error) {
         next(error);
@@ -83,7 +95,7 @@ export const deleteRoleController = async (req, res, next) => {
         const orgId = requireOrg(req, res);
         if (!orgId) return;
 
-        await roleService.deleteRole(orgId, req.params.id);
+        await roleService.deleteRole(orgId, req.params.id, req.user?._id);
         res.status(200).json({ success: true, data: {}, message: 'Role deleted successfully' });
     } catch (error) {
         next(error);

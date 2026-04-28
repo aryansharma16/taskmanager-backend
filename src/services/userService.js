@@ -3,6 +3,7 @@ import mongoose from 'mongoose';
 import User from '../models/User.js';
 import Role from '../models/Role.js';
 import OrganisationMember from '../models/OrganisationMember.js';
+import { logActivity } from './activityLogService.js';
 
 const isObjectId = (v) => mongoose.isValidObjectId(v);
 
@@ -25,7 +26,14 @@ const findRoleForOrg = async (orgId, roleId) => {
     });
 };
 
-export const createUser = async (adminOrgId, name, email, password, roleId) => {
+export const createUser = async (
+    adminOrgId,
+    name,
+    email,
+    password,
+    roleId,
+    actorId,
+) => {
     if (!name || !email || !password) {
         throw new Error('name, email and password are required');
     }
@@ -41,8 +49,6 @@ export const createUser = async (adminOrgId, name, email, password, roleId) => {
         throw new Error('Role not found or invalid for this organisation');
     }
 
-    // Email is normalised by the schema, but normalise here too so the
-    // existing-user lookup is consistent regardless of casing/whitespace.
     const normalisedEmail = String(email).trim().toLowerCase();
 
     let user = await User.findOne({ email: normalisedEmail });
@@ -68,8 +74,6 @@ export const createUser = async (adminOrgId, name, email, password, roleId) => {
         createdNewUser = true;
     }
 
-    // If membership creation fails (e.g. unique-index race or validation),
-    // roll back the User we just created to avoid orphaning it.
     let orgMember;
     try {
         orgMember = await OrganisationMember.create({
@@ -83,6 +87,22 @@ export const createUser = async (adminOrgId, name, email, password, roleId) => {
         }
         throw err;
     }
+
+    await logActivity({
+        entityType: 'OrganisationMember',
+        entityId: orgMember._id,
+        organisation: adminOrgId,
+        action: 'created',
+        performedBy: actorId,
+        metadata: {
+            targetUserId: user._id,
+            email: normalisedEmail,
+            name: user.name,
+            roleId: role._id,
+            roleName: role.name,
+            alreadyExisted: !createdNewUser,
+        },
+    });
 
     const createdUser = user.toObject();
     delete createdUser.password;
@@ -104,22 +124,30 @@ export const deleteUser = async (adminOrgId, targetId, requestingUserId) => {
         throw new Error('You cannot remove yourself from the organisation');
     }
 
-    // Hard-remove the membership; the underlying User stays so the same
-    // person can belong to / be re-added to other organisations.
     await OrganisationMember.deleteOne({ _id: orgMember._id });
+
+    await logActivity({
+        entityType: 'OrganisationMember',
+        entityId: orgMember._id,
+        organisation: adminOrgId,
+        action: 'deleted',
+        performedBy: requestingUserId,
+        metadata: {
+            targetUserId: orgMember.user,
+            roleId: orgMember.role,
+        },
+    });
 
     return true;
 };
 
 export const getUsers = async (orgId) => {
-    const members = await OrganisationMember.find({
+    return OrganisationMember.find({
         organisation: orgId,
         status: { $ne: 'SUSPENDED' },
     })
         .populate('user', 'name email profilePic status')
         .populate('role', 'name permissions isCustom');
-
-    return members;
 };
 
 export const getUserById = async (orgId, id) => {
@@ -137,7 +165,7 @@ export const getUserById = async (orgId, id) => {
     return member;
 };
 
-export const updateMemberRole = async (orgId, id, newRoleId) => {
+export const updateMemberRole = async (orgId, id, newRoleId, actorId) => {
     if (!newRoleId) {
         throw new Error('roleId is required');
     }
@@ -156,8 +184,23 @@ export const updateMemberRole = async (orgId, id, newRoleId) => {
         throw new Error('Role not found or invalid for this organisation');
     }
 
+    const previousRoleId = member.role;
     member.role = newRole._id;
     await member.save();
+
+    await logActivity({
+        entityType: 'OrganisationMember',
+        entityId: member._id,
+        organisation: orgId,
+        action: 'role_changed',
+        performedBy: actorId,
+        metadata: {
+            targetUserId: member.user,
+            oldRoleId: previousRoleId,
+            newRoleId: newRole._id,
+            newRoleName: newRole.name,
+        },
+    });
 
     return member;
 };

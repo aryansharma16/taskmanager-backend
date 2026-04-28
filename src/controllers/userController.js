@@ -40,7 +40,14 @@ export const createUserController = async (req, res, next) => {
             });
         }
 
-        const result = await createUser(adminOrgId, name, email, password, roleId);
+        const result = await createUser(
+            adminOrgId,
+            name,
+            email,
+            password,
+            roleId,
+            req.user?._id,
+        );
 
         res.status(201).json({ success: true, data: result });
     } catch (error) {
@@ -94,7 +101,12 @@ export const updateMemberRoleController = async (req, res, next) => {
             });
         }
 
-        const updatedMember = await updateMemberRole(orgId, req.params.id, roleId);
+        const updatedMember = await updateMemberRole(
+            orgId,
+            req.params.id,
+            roleId,
+            req.user?._id,
+        );
         res.status(200).json({ success: true, data: updatedMember });
     } catch (error) {
         next(error);

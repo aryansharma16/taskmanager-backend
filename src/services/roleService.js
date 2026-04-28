@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import Role from '../models/Role.js';
 import OrganisationMember from '../models/OrganisationMember.js';
+import { logActivity } from './activityLogService.js';
 
 const isObjectId = (v) => mongoose.isValidObjectId(v);
 
@@ -16,7 +17,7 @@ const sanitisePermissions = (permissions) => {
     return Array.from(new Set(cleaned));
 };
 
-export const createRole = async (orgId, name, permissions, description) => {
+export const createRole = async (orgId, name, permissions, description, actorId) => {
     if (typeof name !== 'string' || !name.trim()) {
         throw new Error('Role name is required');
     }
@@ -24,8 +25,6 @@ export const createRole = async (orgId, name, permissions, description) => {
     const normalisedName = name.trim().toUpperCase();
     const cleanedPerms = sanitisePermissions(permissions) || [];
 
-    // Ensure role doesn't already exist in this org for the ORGANISATION
-    // scope (matches the unique compound index).
     const existing = await Role.findOne({
         name: normalisedName,
         organisation: orgId,
@@ -44,13 +43,23 @@ export const createRole = async (orgId, name, permissions, description) => {
         isCustom: true,
     });
 
+    await logActivity({
+        entityType: 'Role',
+        entityId: role._id,
+        organisation: orgId,
+        action: 'created',
+        performedBy: actorId,
+        metadata: {
+            name: role.name,
+            permissions: role.permissions,
+            description: role.description,
+        },
+    });
+
     return role;
 };
 
 export const getRoles = async (orgId) => {
-    // Return roles tied to this org (any scope) plus any global roles
-    // (organisation: null) so the FE can show them — but the FE should
-    // hide edit/delete for non-custom or non-org roles.
     return Role.find({
         $or: [{ organisation: orgId }, { organisation: null }],
     });
@@ -73,8 +82,6 @@ export const getRoleById = async (orgId, roleId) => {
     return role;
 };
 
-// Resolve a role for a mutating action (update/delete). Returns either a
-// loaded role or a typed error so callers can surface specific reasons.
 const resolveCustomRoleForOrg = async (orgId, roleId) => {
     if (!isObjectId(roleId)) {
         return { error: 'Invalid roleId' };
@@ -95,11 +102,16 @@ const resolveCustomRoleForOrg = async (orgId, roleId) => {
     return { role };
 };
 
-export const updateRole = async (orgId, roleId, permissions, description) => {
+export const updateRole = async (orgId, roleId, permissions, description, actorId) => {
     const { role, error } = await resolveCustomRoleForOrg(orgId, roleId);
     if (error) {
         throw new Error(error);
     }
+
+    const before = {
+        permissions: [...role.permissions],
+        description: role.description,
+    };
 
     if (permissions !== undefined) {
         const cleaned = sanitisePermissions(permissions);
@@ -110,17 +122,32 @@ export const updateRole = async (orgId, roleId, permissions, description) => {
     }
 
     await role.save();
+
+    await logActivity({
+        entityType: 'Role',
+        entityId: role._id,
+        organisation: orgId,
+        action: 'updated',
+        performedBy: actorId,
+        metadata: {
+            name: role.name,
+            before,
+            after: {
+                permissions: role.permissions,
+                description: role.description,
+            },
+        },
+    });
+
     return role;
 };
 
-export const deleteRole = async (orgId, roleId) => {
+export const deleteRole = async (orgId, roleId, actorId) => {
     const { role, error } = await resolveCustomRoleForOrg(orgId, roleId);
     if (error) {
         throw new Error(error);
     }
 
-    // Block deletion when the role is still assigned to one or more
-    // members; otherwise we'd leave dangling refs on OrganisationMember.
     const inUse = await OrganisationMember.countDocuments({ role: role._id });
     if (inUse > 0) {
         throw new Error(
@@ -128,6 +155,22 @@ export const deleteRole = async (orgId, roleId) => {
         );
     }
 
+    const snapshot = {
+        name: role.name,
+        permissions: [...role.permissions],
+        description: role.description,
+    };
+
     await Role.findByIdAndDelete(role._id);
+
+    await logActivity({
+        entityType: 'Role',
+        entityId: role._id,
+        organisation: orgId,
+        action: 'deleted',
+        performedBy: actorId,
+        metadata: snapshot,
+    });
+
     return true;
 };
