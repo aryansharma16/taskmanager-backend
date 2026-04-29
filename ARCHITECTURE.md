@@ -68,11 +68,16 @@ this. Full details, edge-case matrix, and API reference live in
 
 ### Task Engine
 
-- **`Task`**: The core entity. Contains references to the `Workspace`, `User` (creator), `Status`, and `Priority`. It includes an `assignees` array for blazing-fast "assigned to me" read queries and a `parentTask` reference for subtasks.
+- **`Task`**: The core entity. Contains references to the `Workspace`, `User` (creator), `Status`, and `Priority`. It includes an `assignees` array for blazing-fast "assigned to me" read queries and a `parentTask` reference for subtasks. The `order` field (a `Number`) gives every task a position inside its `(workspace, status)` Kanban column; fractional values let drag-and-drop insert between two siblings without renumbering the column.
 - **`TaskAssignment`**: A join table mapping `User` to `Task`.
-  - **Why this model?** While the `assignees` array on `Task` handles fast filtering, this collection tracks *metadata* about the assignment (e.g., "LEADER" vs "WATCHER"). This prevents huge document sizes from heavy metadata while still maintaining read optimization on the `Task` itself.
+  - **Why this model?** While the `assignees` array on `Task` handles fast filtering, this collection tracks *metadata* about the assignment (e.g., "LEADER" vs "WATCHER"). This prevents huge document sizes from heavy metadata while still maintaining read optimization on the `Task` itself. The `assignees` array is rebuilt from `TaskAssignment` rows on every assignment mutation — `TaskAssignment` is the source of truth.
 - **`Status` & `Priority`**: Look-up tables linked to a `Workspace`.
   - **Why separate models?** Instead of hardcoding statuses (e.g., "To Do", "In Progress"), giving them their own model allows each Workspace to define custom workflows (e.g., "In QA", "Awaiting Client").
+  - **Status CRUD lives at `/api/workspaces/:id/statuses`**, gated by `read:task` for reads and a dedicated `manage:status` perm for mutations. Deletion is non-destructive by default: it's blocked while any active task references the status, unless the caller passes `reassignTo=<otherStatusId|null>` to bulk-migrate the column. Archived tasks are intentionally left untouched so a future restore never lands them in a column the user never picked. See [docs/TASK_LAYER.md §6](docs/TASK_LAYER.md) and [docs/API_REFERENCE.md §5.9](docs/API_REFERENCE.md) for the full surface.
+
+#### Task RBAC, ordering & subtasks — see [docs/TASK_LAYER.md](docs/TASK_LAYER.md)
+
+The Task engine plugs into the same hybrid workspace RBAC as the Workspace layer (org wildcard / `manage:workspace` bypass, otherwise an active `WorkspaceMember` whose role grants the action). New permission strings: `read:task`, `create:task`, `update:task`, `delete:task`, `assign:task`. Subtasks are validated to be acyclic (cycle detection walks up the `parentTask` chain on every parent change), archives cascade down the subtree, restores intentionally do not. Drag-and-drop is handled by a dedicated `PATCH /tasks/:id/move` endpoint that resolves the new `order` from `beforeId`/`afterId` siblings (with auto-rebalancing when fractional spacing collapses). Full reference, edge-case matrix, and audit-log table live in [docs/TASK_LAYER.md](docs/TASK_LAYER.md).
 
 ### Collaboration & Organization
 

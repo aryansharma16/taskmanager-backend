@@ -1,50 +1,58 @@
-# Backend API Reference (UI prompt)
+# Backend API Reference (Frontend)
 
-Single self-contained reference for every endpoint exposed by the
-backend. Paste this whole file into a UI-generation prompt and the model
-has everything it needs: auth setup, permission strings, request /
-response shapes, error envelope, and the suggested screen list.
+Quick reference for every HTTP endpoint. Pair this with the FE app to
+wire up screens.
 
-> Stack assumptions: Node.js + Express + MongoDB (Mongoose). All
-> responses are JSON. Base URL: `http://localhost:5000/api`.
+> **Base URL** (`{baseURL}` below): `http://localhost:5000`
+> All paths start with `/api`. All requests/responses are JSON.
+>
+> Examples in this doc use the workspace id `69f0920eff6553f8b326fb92`.
+> Replace it with whatever id the user is currently viewing.
 
 ---
 
-## 1. Conceptual model (what the UI is wrapping)
+## 1. How things bind
 
 ```text
-Organisation (tenant, B2B account)
-├── User (member of one or more organisations via OrganisationMember)
-├── Role (permission bundle; scope = ORGANISATION or WORKSPACE)
-├── OrganisationMember (User x Organisation x Role)
-└── Workspace (project / team silo, archivable)
-    └── WorkspaceMember (User x Workspace x Role)
+Organisation                         (the tenant / company)
+└── User           (via OrganisationMember + an org Role)
+    └── Workspace  (project / team silo)
+        ├── WorkspaceMember          (User × Workspace × workspace Role)
+        ├── Status                   (Kanban column, e.g. "To Do")
+        └── Task                     (the card)
+            ├── status      → Status         (which column)
+            ├── parentTask  → Task           (subtasks; null = root)
+            ├── order: Number                (position inside its column)
+            ├── assignees: [User]            (denormalised; for filters)
+            └── TaskAssignment               (User × Task × role)
 ```
 
-- A user belongs to one or more **Organisations** via
-  `OrganisationMember`, each with an org-level `Role`.
-- An organisation contains zero or more **Workspaces**.
-- A user gains workspace access by being a `WorkspaceMember` (which
-  references a workspace-scoped `Role`), unless their org role grants
-  bypass perms.
+Mental model:
+
+- A **User** logs in and picks an **Organisation** (tenant).
+- Inside the org they see one or more **Workspaces** they belong to.
+- A workspace defines its own **Statuses** (columns) — the board needs
+  at least one before tasks have somewhere to land.
+- A **Task** belongs to a workspace, sits in a Status (or "no status"),
+  has an `order` for its position inside that column, may have a
+  `parentTask` (subtasks), and may have multiple **TaskAssignments**
+  (LEADER / ASSIGNEE / WATCHER per user).
 
 ---
 
-## 2. Authentication
+## 2. Auth setup
 
-- `POST /api/auth/login` returns a JWT in `token`. Store it client-side.
-- Send it on every authenticated request as
-  `Authorization: Bearer <token>`.
-- If the user belongs to multiple organisations, the FE must pick one
-  and send `x-org-id: <organisationId>` on every request. If the user
-  belongs to exactly one org, the header is optional.
-- Recommended axios setup:
+1. `POST {baseURL}/api/auth/login` → returns a JWT.
+2. Store the token, send it on every authenticated request:
+   `Authorization: Bearer <token>`.
+3. If the user belongs to **more than one org**, also send
+   `x-org-id: <organisationId>` on every request.
 
 ```javascript
 import axios from 'axios';
 
 export const api = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000/api',
+  baseURL: import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000',
 });
 
 api.interceptors.request.use((config) => {
@@ -58,86 +66,46 @@ api.interceptors.request.use((config) => {
 
 ---
 
-## 3. Standard response envelope
-
-Every endpoint returns one of:
+## 3. Response envelope
 
 ```json
 // Success
 { "success": true, "data": <payload>, "message"?: "..." }
 
 // Failure
-{ "success": false, "error": "<human readable>", "stack"?: "..." }
+{ "success": false, "error": "<human readable>" }
 ```
 
-### HTTP status codes
-
-| Status | Meaning                                  | Suggested UX                         |
-|--------|------------------------------------------|--------------------------------------|
-| 200    | OK                                       | Render result                        |
-| 201    | Created                                  | Render result + success toast        |
-| 400    | Validation / bad request                 | Inline form error using `error`      |
-| 401    | Token missing / invalid / expired        | Redirect to `/login`                 |
-| 403    | Authenticated but not permitted          | Toast "You don't have access"        |
-| 404    | Not found / cross-tenant probe           | Redirect with toast                  |
-| 409    | Duplicate (slug / email / membership)    | Inline error on offending field      |
-| 5xx    | Server error                             | Generic toast + retry option         |
+| Status | Meaning                          | What the FE does                  |
+|--------|----------------------------------|------------------------------------|
+| 200    | OK                               | Render result                      |
+| 201    | Created                          | Render + success toast             |
+| 400    | Bad request / validation         | Inline form error                  |
+| 401    | Token missing / expired          | Redirect to `/login`               |
+| 403    | Authenticated but not allowed    | "You don't have access" toast      |
+| 404    | Not found / cross-tenant probe   | Redirect with toast                |
+| 409    | Duplicate (slug / email / etc.)  | Inline error on offending field    |
+| 5xx    | Server error                     | Generic toast + retry              |
 
 ---
 
-## 4. Permission catalogue
+## 4. Permissions cheat-sheet
 
-The backend's RBAC is permission-string based (`verb:noun` style).
-A role holds an array of these strings. The wildcard `*` overrides
-everything.
+Permissions are strings. The wildcard `*` overrides everything.
 
-### Org-level permissions
+**Org-level** (granted on a user's org Role):
+`*`, `read:org`, `update:org`, `delete:org`, `create:user`, `read:user`,
+`update:user`, `delete:user`, `create:role`, `read:role`, `update:role`,
+`delete:role`, `create:workspace`, `read:workspace`, `update:workspace`,
+`delete:workspace`, `manage:workspace` (org bypass for workspace
+endpoints), `manage:workspace_members`.
 
-| String                       | What it allows                                      |
-|------------------------------|-----------------------------------------------------|
-| `*`                          | Super admin — bypasses every check                  |
-| `read:org`                   | View org details                                    |
-| `update:org`                 | Edit org details                                    |
-| `delete:org` (`*` only)      | Suspend org                                         |
-| `create:user`                | Add a member to the org                             |
-| `read:user`                  | List/read members                                   |
-| `update:user`                | Change a member's role                              |
-| `delete:user`                | Remove a member from the org                        |
-| `create:role`                | Create a custom role                                |
-| `read:role`                  | List/read roles                                     |
-| `update:role`                | Edit a custom role                                  |
-| `delete:role`                | Delete a custom role                                |
-| `create:workspace`           | Create a workspace                                  |
-| `read:workspace`             | List workspaces (scope still narrowed by membership)|
-| `update:workspace`           | Edit a workspace (org bypass)                       |
-| `delete:workspace`           | Archive a workspace (org bypass)                    |
-| `manage:workspace`           | **Bypass perm**: act on any workspace in the tenant |
-| `manage:workspace_members`   | Manage members on any workspace (when combined with bypass) |
+**Workspace-level** (granted on a user's workspace Role):
+`read:workspace`, `update:workspace`, `delete:workspace`,
+`manage:workspace_members`, `read:task`, `create:task`, `update:task`,
+`delete:task`, `assign:task`, `manage:status`.
 
-The `OWNER` role auto-seeded for new tenants holds all of these except
-`*` and `delete:org`.
-
-### Workspace-level permissions (workspace-scoped roles)
-
-| String                       | What it allows inside a workspace                    |
-|------------------------------|------------------------------------------------------|
-| `read:workspace`             | View workspace + members                             |
-| `update:workspace`           | Edit workspace name/slug/description, restore        |
-| `delete:workspace`           | Archive workspace                                    |
-| `manage:workspace_members`   | Add/remove members; change member roles              |
-| (future) `create:task`, `read:task`, `update:task`, `delete:task`, `assign:task` | Task engine permissions, reserved for the next phase. |
-
-### Hybrid RBAC for workspace endpoints
-
-Workspace-scoped routes apply this check:
-
-1. If the requester's **org role** has `*` or `manage:workspace`,
-   allow.
-2. Otherwise the requester must have an `ACTIVE` `WorkspaceMember`
-   whose `role.permissions` include every required workspace
-   permission.
-
-The FE should mirror this when deciding which buttons to show:
+**Hybrid rule for any `/api/workspaces/:id/...` endpoint:**
 
 ```javascript
 const can = (perm) => {
@@ -149,48 +117,35 @@ const can = (perm) => {
 
 ---
 
-## 5. Endpoint reference
+## 5. Endpoints
 
-> Notation: `:id` means a 24-char Mongo ObjectId. All authenticated
-> routes also need `Authorization: Bearer <token>` (omitted from each
-> row for brevity).
+> All examples use real ObjectId-shaped placeholders. Replace
+> `69f0920eff6553f8b326fb92` (workspaceId), `aa11...` (taskId), etc.
 
-### 5.1 Auth
+### 5.1 Auth (public)
 
-#### `POST /api/auth/register`
+| Method | URL | What it does |
+|---|---|---|
+| POST | `{baseURL}/api/auth/register` | Bootstrap a brand-new tenant: creates an Organisation, the OWNER role, the first User, and the membership row. Returns the org + user. |
+| POST | `{baseURL}/api/auth/login`    | Email + password → returns a JWT and the orgs the user belongs to. |
 
-Public. Bootstraps a brand-new tenant: creates an `Organisation`, the
-default `OWNER` role (with full org + workspace perms), the first
-`User`, and the join `OrganisationMember`.
-
-Body:
+**Register body:**
 ```json
 {
-  "orgName":     "Acme Inc",
-  "slug":        "acme",
-  "userName":    "Alice Owner",
-  "userEmail":   "alice@acme.com",
-  "userPassword":"super-secret-123"
+  "orgName":      "Acme Inc",
+  "slug":         "acme",
+  "userName":     "Alice Owner",
+  "userEmail":    "alice@acme.com",
+  "userPassword": "super-secret-123"
 }
 ```
-200/201 response `data`:
-```json
-{
-  "organisation": { "_id": "...", "name": "Acme Inc", "slug": "acme", "..." : "..." },
-  "user":         { "_id": "...", "name": "Alice Owner", "email": "alice@acme.com" }
-}
-```
-Errors: `400` (missing fields), `409` (slug or email already taken).
 
-#### `POST /api/auth/login`
-
-Public. Returns a JWT and the list of organisations the user belongs to.
-
-Body:
+**Login body:**
 ```json
 { "email": "alice@acme.com", "password": "super-secret-123" }
 ```
-200 response:
+
+**Login response (200):**
 ```json
 {
   "success": true,
@@ -200,415 +155,422 @@ Body:
     "name":  "Alice Owner",
     "email": "alice@acme.com",
     "organisations": [
-      {
-        "organisationId": "<orgId>",
-        "name": "Acme Inc",
-        "slug": "acme",
-        "role": "OWNER"
-      }
+      { "organisationId": "<orgId>", "name": "Acme Inc", "slug": "acme", "role": "OWNER" }
     ]
   }
 }
 ```
-Errors: `401` for any login failure (wrong password, deactivated user,
-missing email).
 
-> The login response gives you the role *name* per org, not the full
-> permission list. If the FE needs the perm list to gate UI without
-> another round-trip, fetch `GET /api/roles?scope=ORGANISATION` after
-> login and look up by name; or extend the backend to embed permissions
-> in the JWT.
+> If `organisations.length > 1`, force an org-picker step before the
+> first authenticated call (it sets `x-org-id`).
 
 ---
 
 ### 5.2 Organisations
 
-All require `authenticate`. Endpoints marked `*` require the wildcard
-permission (super admin only).
-
-| Method | Path                          | Permission   | What it does                                |
-|--------|-------------------------------|--------------|---------------------------------------------|
-| POST   | `/api/organisations`          | `*`          | Create a new tenant (typically registration handles this; super-admin tool). |
-| GET    | `/api/organisations`          | `*`          | List every organisation in the system.       |
-| GET    | `/api/organisations/:id`      | `read:org`   | Fetch a tenant. The controller enforces that non-`*` users can only fetch *their own* org. |
-| PUT    | `/api/organisations/:id`      | `update:org` | Edit org fields (name, description, logo, website, industry, billingEmail, subscriptionPlan, metadata). Same own-tenant guard. |
-| DELETE | `/api/organisations/:id`      | `delete:org` | Soft-suspend the org (`isActive=false`, `subscriptionStatus='canceled'`). |
-
-Organisation document shape (response):
-```json
-{
-  "_id": "...", "name": "Acme Inc", "slug": "acme",
-  "description": "", "logo": "", "website": "", "industry": "",
-  "subscriptionPlan": "free|pro|enterprise",
-  "subscriptionStatus": "active|past_due|canceled|trialing",
-  "billingEmail": null, "isActive": true,
-  "createdAt": "...", "updatedAt": "..."
-}
-```
+| Method | URL | Perm | What it does |
+|---|---|---|---|
+| POST   | `{baseURL}/api/organisations`           | `*`           | Create a new tenant (super-admin only; usually `register` is used instead). |
+| GET    | `{baseURL}/api/organisations`           | `*`           | List every organisation in the system. |
+| GET    | `{baseURL}/api/organisations/<orgId>`   | `read:org`    | Fetch a tenant. Non-super-admins can only read their own org. |
+| PUT    | `{baseURL}/api/organisations/<orgId>`   | `update:org`  | Edit name/description/logo/website/industry/billingEmail/subscriptionPlan/metadata. |
+| DELETE | `{baseURL}/api/organisations/<orgId>`   | `delete:org`  | Soft-suspend the org. |
 
 ---
 
 ### 5.3 Roles
 
-All require `authenticate`. Roles can be **org-scoped** (default) or
-**workspace-scoped** (`scope: 'WORKSPACE'`).
+A `Role` is a permission bundle. Scope is `ORGANISATION` (default) or
+`WORKSPACE`. Workspace-scoped roles are picked when adding workspace
+members or creating workspaces.
 
-| Method | Path                | Permission     | What it does                                    |
-|--------|---------------------|----------------|-------------------------------------------------|
-| POST   | `/api/roles`        | `create:role`  | Create a custom role.                           |
-| GET    | `/api/roles`        | `read:role`    | List roles. Optional query: `?scope=ORGANISATION|WORKSPACE`. Returns both tenant-scoped roles and globally-scoped (`organisation: null`) defaults. |
-| GET    | `/api/roles/:id`    | `read:role`    | Fetch a role.                                   |
-| PUT    | `/api/roles/:id`    | `update:role`  | Edit `permissions` and/or `description`. Cannot edit non-custom or global roles. |
-| DELETE | `/api/roles/:id`    | `delete:role`  | Delete a custom role. Rejected if it's still assigned to any `OrganisationMember` *or* `WorkspaceMember`. |
+| Method | URL | Perm | What it does |
+|---|---|---|---|
+| POST   | `{baseURL}/api/roles`              | `create:role` | Create a custom role. |
+| GET    | `{baseURL}/api/roles`              | `read:role`   | List roles. Filter with `?scope=ORGANISATION` or `?scope=WORKSPACE`. |
+| GET    | `{baseURL}/api/roles/<roleId>`     | `read:role`   | Fetch one role. |
+| PUT    | `{baseURL}/api/roles/<roleId>`     | `update:role` | Edit `permissions` / `description`. System / global roles are read-only. |
+| DELETE | `{baseURL}/api/roles/<roleId>`     | `delete:role` | Delete a custom role. Rejected if any member still uses it. |
 
-#### Create body
-
+**Create body:**
 ```json
 {
-  "name": "WORKSPACE_OWNER",          // required, uppercased server-side
-  "scope": "WORKSPACE",                // optional, defaults to "ORGANISATION"
+  "name":        "WORKSPACE_OWNER",
+  "scope":       "WORKSPACE",
   "description": "Full control inside this workspace",
-  "permissions": [
-    "read:workspace", "update:workspace", "delete:workspace",
-    "manage:workspace_members"
-  ]
+  "permissions": ["read:workspace", "update:workspace", "manage:workspace_members"]
 }
 ```
 
-#### Update body
-
+**Update body:**
 ```json
-{ "permissions": [...], "description": "optional new description" }
+{ "permissions": ["..."], "description": "..." }
 ```
-
-#### Role document shape
-
-```json
-{
-  "_id": "...", "name": "WORKSPACE_OWNER",
-  "scope": "ORGANISATION|WORKSPACE|SYSTEM",
-  "organisation": "<orgId|null>",
-  "permissions": ["..."],
-  "description": "...",
-  "isCustom": true,
-  "createdAt": "...", "updatedAt": "..."
-}
-```
-
-Errors:
-- `400 Role name is required`, `400 permissions must be an array of strings`, `400 Invalid scope`.
-- `409 Duplicate value for name, organisation, scope` if the role already exists.
-- `400 Cannot modify system/global roles`, `400 Role does not belong to your organisation`, `400 Cannot modify system default roles`.
-- `400 Cannot delete role: it is still assigned to N member(s) (org: X, workspace: Y).`
 
 ---
 
-### 5.4 Users (organisation members)
+### 5.4 Users (org members)
 
-All require `authenticate`. `:id` accepts **either** the
-`OrganisationMember._id` returned by `GET /api/users` **or** the
+`<userId>` here accepts **either** the `OrganisationMember._id` or the
 underlying `User._id`.
 
-| Method | Path                          | Permission     | What it does                                                             |
-|--------|-------------------------------|----------------|--------------------------------------------------------------------------|
-| POST   | `/api/users`                  | `create:user`  | Add a user to the current org. Creates the `User` if email is new; else attaches the existing user to the current org. |
-| GET    | `/api/users`                  | `read:user`    | List active members of the current org (suspended members are filtered out). |
-| GET    | `/api/users/:id`              | `read:user`    | Fetch a single member by membership id or user id.                       |
-| PUT    | `/api/users/:id/role`         | `update:user`  | Change the member's role. Body: `{ roleId | role }`.                     |
-| DELETE | `/api/users/:id`              | `delete:user`  | Remove the member from the org (the underlying `User` is preserved). Self-removal is rejected with `400`. |
+| Method | URL | Perm | What it does |
+|---|---|---|---|
+| POST   | `{baseURL}/api/users`                  | `create:user` | Add a user to the current org. Creates the User if email is new, else attaches the existing one. |
+| GET    | `{baseURL}/api/users`                  | `read:user`   | List active org members. |
+| GET    | `{baseURL}/api/users/<userId>`         | `read:user`   | Fetch one member. |
+| PUT    | `{baseURL}/api/users/<userId>/role`    | `update:user` | Change member's org role. Body: `{ "roleId": "..." }`. |
+| DELETE | `{baseURL}/api/users/<userId>`         | `delete:user` | Remove member from the org (User row is preserved). Self-removal is rejected. |
 
-#### Create body
-
+**Create body:**
 ```json
 {
   "name":     "Bob Member",
   "email":    "bob@acme.com",
   "password": "another-secret-1",
-  "roleId":   "<role _id>"   // alias accepted: "role"
+  "roleId":   "<role _id>"
 }
 ```
-
-201 response `data`:
-```json
-{
-  "user":           { "_id": "...", "name": "...", "email": "...", "..." : "..." },
-  "membership":     { "_id": "...", "user": "...", "organisation": "...", "role": "...", "status": "ACTIVE", "..." : "..." },
-  "alreadyExisted": false
-}
-```
-
-`alreadyExisted: true` means the email matched an existing `User`
-across the platform; the `password` from the body was ignored and the
-user was simply attached to your org.
-
-#### Member document (returned by list / get)
-
-```json
-{
-  "_id": "<membershipId>",
-  "user": { "_id": "...", "name": "...", "email": "...", "profilePic": "...", "status": "active|suspended|invited" },
-  "organisation": "<orgId>",
-  "role": { "_id": "...", "name": "...", "permissions": ["..."], "isCustom": true },
-  "status": "ACTIVE|SUSPENDED|INVITED",
-  "createdAt": "...", "updatedAt": "..."
-}
-```
-
-Errors:
-- `400 name, email and password are required`, `400 roleId is required`, `400 Invalid roleId`.
-- `400 User is already a member of this organisation`.
-- `400 You cannot remove yourself from the organisation`.
-- `409 Duplicate value for email` if the email is already in use globally.
 
 ---
 
 ### 5.5 Workspaces
 
-All require `authenticate`. `:id` (and `:memberId` further down) is a
-Mongo ObjectId. Workspace-scoped routes use the **hybrid RBAC** model
-(see section 4).
+A workspace is a project/team silo inside an org. `<workspaceId>` is a
+24-char ObjectId.
 
-| Method | Path                                              | Org permission         | Workspace permission              | What it does                                                                                   |
-|--------|---------------------------------------------------|------------------------|-----------------------------------|------------------------------------------------------------------------------------------------|
-| POST   | `/api/workspaces`                                 | `create:workspace`     | -                                 | Create a workspace. Creator is auto-added with the role they pick.                              |
-| GET    | `/api/workspaces`                                 | `read:workspace`       | -                                 | List workspaces. Non-bypass users see only workspaces they're an `ACTIVE` member of.            |
-| GET    | `/api/workspaces/:id`                             | -                      | `read:workspace` (or org bypass)  | Fetch a workspace + member count.                                                              |
-| PUT    | `/api/workspaces/:id`                             | -                      | `update:workspace` (or bypass)    | Update name, slug, description, metadata.                                                       |
-| DELETE | `/api/workspaces/:id`                             | -                      | `delete:workspace` (or bypass)    | Archive (soft-delete). `isActive=false`, `archivedAt=now`.                                      |
-| PATCH  | `/api/workspaces/:id/restore`                     | -                      | `update:workspace` (or bypass)    | Un-archive. Only endpoint that operates on archived workspaces.                                |
+| Method | URL | Perm | What it does |
+|---|---|---|---|
+| POST   | `{baseURL}/api/workspaces`                                                 | org `create:workspace`  | Create a workspace. Creator is auto-added with their picked workspace role. |
+| GET    | `{baseURL}/api/workspaces`                                                 | org `read:workspace`    | List workspaces. Non-bypass users see only ones they're an active member of. Query: `?page=1&limit=20&includeArchived=false`. |
+| GET    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92`                        | ws `read:workspace`     | Fetch one workspace + member count. |
+| PUT    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92`                        | ws `update:workspace`   | Update name / slug / description / metadata. |
+| DELETE | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92`                        | ws `delete:workspace`   | Archive (soft-delete). |
+| PATCH  | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/restore`                | ws `update:workspace`   | Un-archive. |
 
-#### Create body
-
+**Create body:**
 ```json
 {
   "name":          "Engineering",
-  "slug":          "engineering",                  // optional, auto-derived from name
+  "slug":          "engineering",
   "description":   "Core product team",
-  "creatorRoleId": "<workspace-scoped role _id>",  // aliases: "creatorRole", "roleId", "role"
+  "creatorRoleId": "<workspace-scoped role _id>",
   "initialMembers": [
     { "userId": "<userId>", "roleId": "<workspace-scoped role _id>" }
   ]
 }
 ```
 
-201 response `data`:
+**Get-by-id response:**
 ```json
-{
-  "workspace": {
-    "_id": "...", "name": "Engineering", "slug": "engineering",
-    "description": "Core product team", "organisation": "...",
-    "createdBy": "...", "isActive": true, "archivedAt": null,
-    "metadata": null, "createdAt": "...", "updatedAt": "..."
-  },
-  "memberFailures": [
-    { "userId": "<id>", "error": "<reason this initial member failed>" }
-  ]
-}
+{ "workspace": { "_id": "...", "name": "Engineering", "isActive": true, "..." : "..." }, "memberCount": 7 }
 ```
-
-`memberFailures` is empty in the happy path. The workspace itself
-always succeeds; failures are reported per initial-member entry.
-
-#### List query string
-
-```
-?page=1&limit=20&includeArchived=false
-```
-- `page` defaults `1`, `limit` defaults `20`, max `100`.
-- `includeArchived=true` is silently ignored for users without
-  `*` or `manage:workspace`.
-
-200 response `data`:
-```json
-{
-  "items": [
-    {
-      "_id": "...", "name": "Engineering", "slug": "engineering",
-      "description": "...", "organisation": "...",
-      "createdBy": { "_id": "...", "name": "...", "email": "..." },
-      "isActive": true, "archivedAt": null,
-      "createdAt": "...", "updatedAt": "..."
-    }
-  ],
-  "page":  1,
-  "limit": 20,
-  "total": 1
-}
-```
-
-#### Get-by-id response
-
-```json
-{ "workspace": { "..." : "..." }, "memberCount": 7 }
-```
-
-#### Update body (partial)
-
-```json
-{
-  "name":        "New name",
-  "slug":        "new-slug",
-  "description": "Updated description",
-  "metadata":    { "theme": "dark" }
-}
-```
-
-#### Errors
-
-- `400 Invalid workspace id`, `400 name is required`, `400 creatorRoleId is required`, `400 initialMembers must be an array`, `400 Each initialMembers entry must include userId and roleId`.
-- `400 creatorRoleId is invalid or not a WORKSPACE-scoped role for this organisation`.
-- `400 User <id> is not an active member of this organisation` (during create).
-- `404 Workspace not found` (cross-tenant probe).
-- `400 Workspace is archived. Restore it before performing this action.`
-- `400 Workspace is already archived` / `400 Workspace is not archived`.
-- `409 Duplicate value for organisation, slug` / `organisation, name`.
 
 ---
 
 ### 5.6 Workspace members
 
-All require `authenticate` + `requireWorkspaceContext`. `:memberId`
-accepts either `WorkspaceMember._id` (preferred — it's what the list
-endpoint returns) or the underlying `User._id`.
+`<memberId>` accepts either the `WorkspaceMember._id` (preferred) or
+the underlying `User._id`.
 
-| Method | Path                                                  | Workspace permission              | What it does                                                                |
-|--------|-------------------------------------------------------|-----------------------------------|-----------------------------------------------------------------------------|
-| GET    | `/api/workspaces/:id/members`                         | `read:workspace` (or org bypass)  | Paginated list of members. Query: `?status=ACTIVE|SUSPENDED|INVITED&page&limit`. Default `limit=50`, max `200`. |
-| POST   | `/api/workspaces/:id/members`                         | `manage:workspace_members`        | Add a member.                                                               |
-| PUT    | `/api/workspaces/:id/members/:memberId`               | `manage:workspace_members`        | Change member role.                                                         |
-| DELETE | `/api/workspaces/:id/members/:memberId`               | `manage:workspace_members`        | Remove member (hard-delete the membership row).                              |
+| Method | URL | Perm | What it does |
+|---|---|---|---|
+| GET    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/members`                          | ws `read:workspace`           | Paginated members list. Query: `?status=ACTIVE|SUSPENDED|INVITED&page&limit`. |
+| POST   | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/members`                          | ws `manage:workspace_members` | Add a member. |
+| PUT    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/members/<memberId>`               | ws `manage:workspace_members` | Change member's role. |
+| DELETE | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/members/<memberId>`               | ws `manage:workspace_members` | Remove the membership row. |
 
-#### Add body
+**Add / change-role bodies:**
 ```json
-{ "userId": "<orgMemberUserId>", "roleId": "<workspace-scoped role _id>" }
+{ "userId": "<orgUserId>", "roleId": "<workspace-scoped role _id>" }
 ```
-> The `userId` must be the underlying `User._id` (the one inside an
-> `OrganisationMember`), not the membership id.
-
-#### Change-role body
 ```json
 { "roleId": "<workspace-scoped role _id>" }
 ```
 
-#### Member document (list/add response)
+---
 
+### 5.7 Statuses (Kanban columns)
+
+A workspace **must have at least one Status** before its board renders
+real columns. If the FE shows "A board needs at least one status…",
+that's the empty-list state of `GET /statuses`.
+
+| Method | URL | Perm | What it does |
+|---|---|---|---|
+| GET    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/statuses`                              | `read:task`     | List statuses, sorted by name. Add `?withTaskCounts=true` to get a `taskCount` per status (active tasks only). |
+| POST   | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/statuses`                              | `manage:status` | Create a status. |
+| GET    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/statuses/<statusId>`                   | `read:task`     | Fetch one status + active task count. |
+| PUT    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/statuses/<statusId>`                   | `manage:status` | Rename / re-color. |
+| DELETE | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/statuses/<statusId>?reassignTo=<id>`   | `manage:status` | Delete. Blocked while any active task uses it; pass `reassignTo` to migrate. |
+
+**Create / update body:**
+```json
+{ "name": "In Progress", "color": "#f59e0b" }
+```
+- `name` required, max 60 chars, **unique per workspace** (case-insensitive).
+- `color` optional hex (`#RGB` or `#RRGGBB`); defaults to `#cccccc`.
+
+**List response (with `?withTaskCounts=true`):**
+```json
+[
+  { "_id": "s1", "name": "To Do",       "color": "#94a3b8", "workspace": "...", "taskCount": 5 },
+  { "_id": "s2", "name": "In Progress", "color": "#f59e0b", "workspace": "...", "taskCount": 2 },
+  { "_id": "s3", "name": "Done",        "color": "#10b981", "workspace": "...", "taskCount": 12 }
+]
+```
+
+**Get-by-id response:**
+```json
+{ "status": { "_id": "s1", "name": "To Do", "color": "#94a3b8", "workspace": "..." }, "taskCount": 5 }
+```
+
+**Delete with reassignment**
+
+If `taskCount > 0` you must tell the API where the existing tasks should go:
+
+- `?reassignTo=<otherStatusId>` — move all active tasks to that status, then delete.
+- `?reassignTo=null` — clear the status on those tasks (they fall into the "no status" column), then delete.
+- Omit it → backend returns `400` with the count.
+
+```http
+DELETE {baseURL}/api/workspaces/69f0920eff6553f8b326fb92/statuses/s1?reassignTo=s2
+```
+
+Response:
+```json
+{ "success": true, "data": { "reassignedTaskCount": 5 }, "message": "Status deleted" }
+```
+
+---
+
+### 5.8 Tasks
+
+Tasks live under a workspace. The board view returns one bucket per
+status; tasks without a status fall into a leading "no status" bucket
+(skipped if empty).
+
+| Method | URL | Perm | What it does |
+|---|---|---|---|
+| POST   | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/tasks`                                  | `create:task` | Create a task. |
+| GET    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/tasks`                                  | `read:task`   | Paginated flat list with filters (see below). |
+| GET    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/tasks/board`                            | `read:task`   | **Kanban view**: tasks bucketed by status, ordered by `order`. |
+| GET    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/tasks/<taskId>`                         | `read:task`   | One task + assignments + `subtaskCount`. |
+| PUT    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/tasks/<taskId>`                         | `update:task` | Edit fields. Changing `status` here re-snaps the task to the bottom of the new column (use `/move` for a specific position). |
+| DELETE | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/tasks/<taskId>`                         | `delete:task` | Archive (soft-delete). Cascades down all subtasks. |
+| PATCH  | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/tasks/<taskId>/restore`                 | `update:task` | Un-archive (single task; not cascading). |
+| PATCH  | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/tasks/<taskId>/move`                    | `update:task` | **Drag-and-drop**: pick new column / position. |
+| GET    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/tasks/<taskId>/subtasks`                | `read:task`   | Direct children (one level), ordered. |
+
+**Create body:**
 ```json
 {
-  "_id": "<workspaceMemberId>",
-  "user":      { "_id": "...", "name": "...", "email": "...", "profilePic": "..." },
-  "workspace": "<workspaceId>",
-  "role":      { "_id": "...", "name": "...", "permissions": ["..."], "scope": "WORKSPACE", "isCustom": true },
-  "status":    "ACTIVE|SUSPENDED|INVITED",
-  "addedBy":   "<userId|null>",
+  "title":        "Wire up auth screen",
+  "description":  "Markdown supported.",
+  "statusId":     "<statusId|null>",
+  "priorityId":   "<priorityId|null>",
+  "parentTaskId": "<taskId|null>",
+  "dueDate":      "2026-05-01T00:00:00Z",
+  "startDate":    "2026-04-29T00:00:00Z",
+  "assignees": [
+    "<userId>",
+    { "userId": "<userId>", "role": "LEADER" }
+  ]
+}
+```
+- Only `title` is required. `assignees` accepts bare user ids (default
+  role `ASSIGNEE`) or `{ userId, role }`. All assignees must be active
+  workspace members.
+- `statusId` / `priorityId` / `parentTaskId` are also accepted as
+  `status` / `priority` / `parentTask` (legacy alias). Pick whichever
+  you prefer — both forms hit the same validator. **`status` without
+  the `Id` suffix used to be silently ignored when the wrong key was
+  sent; that's no longer the case.**
+
+**Create response (201):**
+```json
+{
+  "task": { "_id": "...", "title": "...", "order": 1000, "isArchived": false, "..." : "..." },
+  "assignmentFailures": []
+}
+```
+
+**List query string:**
+```
+?page=1&limit=50
+&includeArchived=false
+&statusId=<statusId>       (or statusId=null for tasks with no status)
+&priorityId=<priorityId>
+&assigneeId=<userId>
+&createdById=<userId>
+&parentTaskId=<taskId>     (or parentTaskId=null for root-level only)
+&search=<title-substring>  (case-insensitive, max 80 chars)
+&dueBefore=<ISODate>&dueAfter=<ISODate>
+&sort=order|createdAt|updatedAt|dueDate|title
+&sortDir=asc|desc
+```
+Bare-name query keys (`status`, `priority`, `assignee`, `createdBy`,
+`parentTask`) are also accepted for backwards compat.
+
+**List response:**
+```json
+{ "items": [<task>, ...], "page": 1, "limit": 50, "total": 12 }
+```
+
+**Board response** (`GET /tasks/board`):
+```json
+[
+  { "status": { "_id": "s1", "name": "To Do",       "color": "#94a3b8" }, "tasks": [<task>, ...] },
+  { "status": { "_id": "s2", "name": "In Progress", "color": "#f59e0b" }, "tasks": [<task>, ...] },
+  { "status": { "_id": "s3", "name": "Done",        "color": "#10b981" }, "tasks": [<task>, ...] }
+]
+```
+A `null`-status bucket appears at the front only if some tasks have no
+status. Query: `?rootOnly=false` to include subtasks, `?includeArchived=true`
+to show archived rows.
+
+**Get-by-id response:**
+```json
+{
+  "task": { "_id": "...", "title": "...", "..." : "..." },
+  "assignments": [
+    { "_id": "...", "user": { "_id": "...", "name": "...", "email": "..." }, "role": "ASSIGNEE" }
+  ],
+  "subtaskCount": 3
+}
+```
+
+**Update body** (any subset):
+```json
+{
+  "title":        "...",
+  "description":  "...",
+  "statusId":     "<statusId|null>",
+  "priorityId":   "<priorityId|null>",
+  "parentTaskId": "<taskId|null>",
+  "dueDate":      "<ISODate|null>",
+  "startDate":    "<ISODate|null>",
+  "completedAt":  "<ISODate|null>",
+  "order":        1500
+}
+```
+
+**Move body** (drag-and-drop) — pass the sibling ids in the *target* column:
+```json
+{
+  "statusId":     "<statusId|null>",
+  "parentTaskId": "<taskId|null>",
+  "beforeId":     "<task that should sit ABOVE the dropped task>",
+  "afterId":      "<task that should sit BELOW the dropped task>"
+}
+```
+
+> Both `statusId` and `status`, `priorityId` and `priority`,
+> `parentTaskId` and `parentTask` are accepted on every task body
+> (create / update / move). The `Id`-suffixed names are the recommended
+> form because they read better when the value is an ObjectId; the bare
+> names are kept for backwards compat.
+
+How `order` is computed:
+
+| `beforeId` | `afterId` | New `order` |
+|---|---|---|
+| yes | yes | `(before.order + after.order) / 2` |
+| yes | no  | `before.order + 1000` (drop at bottom) |
+| no  | yes | `after.order  - 1000` (drop at top)    |
+| no  | no  | append: `max(order in target column) + 1000` |
+
+If the column gets too dense the backend rebalances it to a clean
+1000-step sequence and recomputes — transparent to the FE.
+
+---
+
+### 5.9 Task assignments
+
+A `TaskAssignment` is the source of truth for who's on a task and in
+what role. The denormalised `Task.assignees: [User]` array is rebuilt
+automatically on every assignment mutation, so the
+`?assignee=<userId>` filter on `GET /tasks` always stays accurate.
+
+| Method | URL | Perm | What it does |
+|---|---|---|---|
+| GET    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/tasks/<taskId>/assignments`                          | `read:task`   | List assignments with populated user. |
+| POST   | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/tasks/<taskId>/assignments`                          | `assign:task` | Add an assignment. |
+| PUT    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/tasks/<taskId>/assignments/<assignmentId>`           | `assign:task` | Change role. |
+| DELETE | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/tasks/<taskId>/assignments/<assignmentId>`           | `assign:task` | Remove the row. |
+
+**Add body:**
+```json
+{ "userId": "<userId>", "role": "LEADER" }
+```
+- `role` is `LEADER | ASSIGNEE | WATCHER`. Defaults to `ASSIGNEE`.
+- `userId` must be an active workspace member.
+
+**Change-role body:**
+```json
+{ "role": "ASSIGNEE" }
+```
+
+**Assignment document:**
+```json
+{
+  "_id":  "...",
+  "task": "<taskId>",
+  "user": { "_id": "...", "name": "...", "email": "...", "profilePic": "..." },
+  "role": "LEADER|ASSIGNEE|WATCHER",
   "createdAt": "...", "updatedAt": "..."
 }
 ```
 
-#### List response
+---
 
-```json
-{ "items": [<member>, ...], "page": 1, "limit": 50, "total": 3 }
+## 6. Common error messages
+
+| Where | Status | Message |
+|---|---|---|
+| Anywhere | 400 | `Invalid id format: <value>` (bad ObjectId in URL) |
+| Anywhere | 404 | `<Resource> not found` (also returned for cross-tenant probes) |
+| Workspace | 400 | `Workspace is archived. Restore it before performing this action.` |
+| Status | 400 | `A status with this name already exists in this workspace` |
+| Status | 400 | `Cannot delete status: N active task(s) still use it. Pass reassignTo to migrate them.` |
+| Task | 400 | `Status does not belong to this workspace` |
+| Task | 400 | `A task cannot be its own parent` / `would create a cycle` |
+| Task | 400 | `Sibling order is inconsistent — the board may be stale, please refresh` (drag-and-drop) |
+| Task | 400 | `Task is archived. Restore it before editing.` |
+| Assignment | 400 | `User <id> is not an active member of this workspace` |
+| Assignment | 409 | `Duplicate value for task, user, role` |
+
+---
+
+## 7. Concrete usage walkthrough
+
+A typical flow for the Kanban screen, end to end:
+
+```text
+1. Login                  → POST {baseURL}/api/auth/login
+2. Pick org (if many)     → set x-org-id header
+3. Pick workspace         → GET  {baseURL}/api/workspaces
+4. Open the board:
+   a. Load columns        → GET  {baseURL}/api/workspaces/<wsId>/statuses?withTaskCounts=true
+      └─ if empty, show "Configure statuses" CTA → POST .../statuses
+   b. Load tasks          → GET  {baseURL}/api/workspaces/<wsId>/tasks/board
+5. Open task details      → GET  {baseURL}/api/workspaces/<wsId>/tasks/<taskId>
+6. Add an assignee        → POST {baseURL}/api/workspaces/<wsId>/tasks/<taskId>/assignments
+7. Drag card to column B  → PATCH {baseURL}/api/workspaces/<wsId>/tasks/<taskId>/move
+                            { "statusId": "<columnB>", "beforeId": "...", "afterId": "..." }
+8. Archive task           → DELETE {baseURL}/api/workspaces/<wsId>/tasks/<taskId>
 ```
 
-Errors:
-- `400 userId is required`, `400 roleId is required`, `400 Invalid workspace id`.
-- `400 roleId is invalid or not a WORKSPACE-scoped role for this organisation`.
-- `400 User <id> is not an active member of this organisation`.
-- `400 User is already a member of this workspace`.
-- `404 Workspace not found`, `404 Workspace member not found`.
-- `409 Duplicate value for user, workspace` (concurrent add race).
+What's bound to what at each step:
 
----
-
-## 6. Suggested UI screens (phase 1 - everything implemented today)
-
-Generate these as a starter set; each screen maps cleanly onto the
-endpoints above.
-
-### Public
-
-1. **Login page**
-   - Form: email + password.
-   - On success, store `token` and (if `organisations.length === 1`) the org id; otherwise show an org-picker step.
-2. **Register page**
-   - Form: orgName, slug (auto-suggested from orgName), userName, userEmail, userPassword.
-   - On success, auto-login and route to `/onboarding`.
-
-### Onboarding wizard (post-register, OWNER only)
-
-3. **Step 1 - Define workspace roles**
-   - List: `GET /api/roles?scope=WORKSPACE`.
-   - Pre-fill three create-role calls (`WORKSPACE_OWNER`, `WORKSPACE_ADMIN`, `WORKSPACE_MEMBER`) with the suggested permission lists from `docs/WORKSPACE_LAYER.md` 8.3.
-   - "Skip" if the user wants to define roles later; the workspace step will then be blocked with a friendly message.
-4. **Step 2 - Create your first workspace**
-   - Same form as the workspace create modal below. On success, route to the workspace detail page.
-
-### Authenticated app shell
-
-5. **Top bar**
-   - Org switcher (if `organisations.length > 1`) — sets `localStorage.activeOrgId` and reloads.
-   - Avatar menu: "Profile", "Logout".
-6. **Sidebar**
-   - "Workspaces" (link to list).
-   - "Members" (org members; visible if `read:user`).
-   - "Roles" (visible if `read:role`).
-   - "Organisation settings" (visible if `read:org`).
-
-### Org-level pages
-
-7. **Org settings page** — `GET /api/organisations/:id`, `PUT /api/organisations/:id`. Show buttons gated by `update:org`.
-8. **Org members page**
-   - List: `GET /api/users` (returns membership rows with `user`, `role`, `status`).
-   - Create modal: `POST /api/users`. `roleId` populated from `GET /api/roles?scope=ORGANISATION`.
-   - Per-row: change role (`PUT /api/users/:id/role`), remove (`DELETE /api/users/:id`).
-9. **Roles page**
-   - Tabs: "Organisation roles" (`?scope=ORGANISATION`), "Workspace roles" (`?scope=WORKSPACE`).
-   - Create / edit / delete via the role endpoints. Hide edit/delete on rows where `isCustom === false` or `organisation == null`.
-
-### Workspace pages
-
-10. **Workspaces list** - `GET /api/workspaces`. Paginator + "Show archived" toggle. "New workspace" CTA gated by `create:workspace`.
-11. **Create workspace modal**
-    - Fields: `name`, optional `slug` (live preview from `slugify(name)`), `description`, `creatorRoleId` (from `GET /api/roles?scope=WORKSPACE`), repeating `initialMembers` rows (user picker from `GET /api/users` + role picker from same workspace-role list).
-12. **Workspace detail page** (`/workspaces/:id`)
-    - Header with name, slug, archived banner if `!isActive`.
-    - Tabs: "Overview" (`GET /api/workspaces/:id` -> `memberCount`), "Members".
-    - Action menu: Edit, Archive (or Restore), gated by hybrid perms.
-13. **Workspace members tab**
-    - `GET /api/workspaces/:id/members` + filter by `status`.
-    - Add modal: `POST /api/workspaces/:id/members`.
-    - Per-row: change role (`PUT /api/workspaces/:id/members/:memberId`), remove (`DELETE /api/workspaces/:id/members/:memberId`).
-    - Confirmation dialog on self-removal: "You'll lose access to this workspace."
-
-### Cross-cutting concerns
-
-14. **Toast / error host** that interprets the standard envelope.
-15. **Permission helper** (`can(perm)`) used by every CTA — see section 4.
-
----
-
-## 7. Edge cases the UI should handle (cheat-sheet)
-
-- `:id` invalid -> `400 Invalid id format`. Render an inline form error or 404 page.
-- Cross-tenant probe -> `404 Workspace not found` / `Resource not found`. Redirect to safety.
-- Editing a role that's a system/global role -> backend returns `400 Cannot modify system/global roles`. Hide edit/delete in the UI for non-custom rows.
-- Deleting a role still assigned to members -> backend returns `400 Cannot delete role: it is still assigned to N member(s)`. Surface this and offer a "Reassign members" link.
-- Duplicate slug/name on workspace create -> `409`. Highlight the offending field.
-- Adding an org-scoped role as `creatorRoleId` -> `400`. Filter the picker to `?scope=WORKSPACE` only.
-- Archived workspace -> `400 Workspace is archived` on every endpoint except `PATCH /:id/restore`. Show a banner with a Restore CTA.
-- Self-removal at org level -> `400`. Disable the row's remove button when `member.user._id === currentUser._id`.
-- Self-removal at workspace level -> allowed, but show a confirmation modal.
-- Multi-org users -> if `organisations.length > 1` after login, force them to pick one before any other call.
-
----
-
-## 8. Out of scope (don't generate UI for these yet)
-
-- Tasks, Statuses, Priorities, Labels, Comments, Attachments — the
-  models exist, but no routes are wired yet.
-- Notifications, Activity feed UI — the `ActivityLog` is being written
-  on every RBAC mutation, but no `GET /api/activity` route exists yet.
-- Email invitations (the schema supports `status: 'INVITED'`, but
-  there's no invite-by-email flow).
-- Cross-org workspace transfer.
-- Stripe / billing flows (org has `subscriptionPlan` / `subscriptionStatus` fields but no webhook routes).
+- The JWT identifies the **User**.
+- `x-org-id` (or the user's only org) selects the **Organisation**.
+- The URL's workspaceId selects the **Workspace** (and tenant-checks
+  the user against it).
+- The task's `status` field selects which **Status** column it lives
+  in. `null` = the leading "no status" bucket.
+- The task's `order` field decides its vertical position inside that
+  column. `/move` is the only endpoint you need for drag-and-drop —
+  pass `beforeId` / `afterId` based on what you dropped between.
+- `TaskAssignment` rows (LEADER / ASSIGNEE / WATCHER) hang off a task;
+  the `Task.assignees` array stays in sync automatically.

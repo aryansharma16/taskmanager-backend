@@ -92,6 +92,34 @@ reference, including the hybrid permission model and edge-case matrix.
 - `GET|POST /api/workspaces/:id/members` - List or add members.
 - `PUT|DELETE /api/workspaces/:id/members/:memberId` - Change role or remove member.
 
+### Tasks (Requires Auth & Workspace Permissions)
+See [docs/TASK_LAYER.md](docs/TASK_LAYER.md) for the full reference,
+including the drag-and-drop algorithm and edge-case matrix.
+
+- `POST /api/workspaces/:id/tasks` - Create a task (subtasks via `parentTask`, initial assignees supported).
+- `GET /api/workspaces/:id/tasks` - Paginated, filterable flat list.
+- `GET /api/workspaces/:id/tasks/board` - Kanban view, tasks bucketed by status and ordered by `order`.
+- `GET /api/workspaces/:id/tasks/:taskId` - Single task with assignments and subtask count.
+- `PUT /api/workspaces/:id/tasks/:taskId` - Update task fields.
+- `DELETE /api/workspaces/:id/tasks/:taskId` - Archive (cascades down subtasks).
+- `PATCH /api/workspaces/:id/tasks/:taskId/restore` - Un-archive a task.
+- `PATCH /api/workspaces/:id/tasks/:taskId/move` - Drag-and-drop move (status / order / parent).
+- `GET /api/workspaces/:id/tasks/:taskId/subtasks` - Direct children, ordered.
+- `GET|POST /api/workspaces/:id/tasks/:taskId/assignments` - List or add task assignments.
+- `PUT|DELETE /api/workspaces/:id/tasks/:taskId/assignments/:assignmentId` - Change role or remove an assignment.
+
+### Statuses (Kanban columns, workspace-scoped)
+A workspace needs at least one `Status` to render real Kanban columns.
+Reads use `read:task`; mutations require the new `manage:status`
+permission. See [docs/API_REFERENCE.md §5.9](docs/API_REFERENCE.md) for
+request/response shapes and the delete-with-`reassignTo` migration.
+
+- `GET /api/workspaces/:id/statuses` - List statuses (`?withTaskCounts=true` for column badges).
+- `POST /api/workspaces/:id/statuses` - Create a status (`{ name, color? }`).
+- `GET /api/workspaces/:id/statuses/:statusId` - Single status + active task count.
+- `PUT /api/workspaces/:id/statuses/:statusId` - Rename / re-color.
+- `DELETE /api/workspaces/:id/statuses/:statusId` - Delete (use `?reassignTo=<id|null>` if it's still in use).
+
 ## Project Structure
 
 ```text
