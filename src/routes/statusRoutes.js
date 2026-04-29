@@ -5,6 +5,7 @@ import {
     getStatusByIdController,
     updateStatusController,
     deleteStatusController,
+    reorderStatusesController,
 } from '../controllers/statusController.js';
 import { authenticate } from '../middleware/authMiddleware.js';
 import {
@@ -32,6 +33,14 @@ router.post(
     '/',
     requireWorkspacePermissions('manage:status'),
     createStatusController,
+);
+
+// Bulk reorder. Declared before `/:statusId` so the literal `reorder`
+// segment isn't captured as a status id.
+router.put(
+    '/reorder',
+    requireWorkspacePermissions('manage:status'),
+    reorderStatusesController,
 );
 
 router.get(

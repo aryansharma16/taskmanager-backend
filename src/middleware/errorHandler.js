@@ -2,6 +2,14 @@ export const errorHandler = (err, req, res, next) => {
     let statusCode = res.statusCode === 200 ? 500 : res.statusCode;
     let message = err.message;
 
+    // Services can opt into a precise status by setting `err.statusCode`
+    // directly (instead of relying on the keyword heuristics below).
+    // This is the preferred path for any new business-rule error —
+    // `throw Object.assign(new Error('...'), { statusCode: 400 })`.
+    if (typeof err.statusCode === 'number') {
+        statusCode = err.statusCode;
+    }
+
     // Mongoose bad ObjectId / cast errors
     if (err.name === 'CastError') {
         statusCode = 400;
@@ -34,15 +42,27 @@ export const errorHandler = (err, req, res, next) => {
             m.includes('required') ||
             m.includes('invalid') ||
             m.includes('already') ||
-            m.includes('cannot')
+            m.includes('cannot') ||
+            m.includes('inconsistent') ||
+            m.includes('did not change') ||
+            m.includes('must ')
         ) {
             statusCode = 400;
         }
     }
 
-    res.status(statusCode).json({
+    const body = {
         success: false,
         error: message,
         stack: process.env.NODE_ENV === 'production' ? null : err.stack,
-    });
+    };
+    // Optional structured payload for FE devs to inspect — e.g. the
+    // observed sibling orders on a `Sibling order is inconsistent`
+    // error so they can spot a swapped prev/next pair without
+    // attaching a debugger.
+    if (err.details && typeof err.details === 'object') {
+        body.details = err.details;
+    }
+
+    res.status(statusCode).json(body);
 };

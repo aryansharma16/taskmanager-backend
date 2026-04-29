@@ -59,6 +59,24 @@ export const updateStatusController = async (req, res, next) => {
     }
 };
 
+// @route PUT /api/workspaces/:id/statuses/reorder
+// Body: `{ orderedIds: [statusId, statusId, ...] }`. Position in the
+// array becomes the new pipeline order. Returns the freshly-sorted
+// list so the client can render without an extra round trip.
+export const reorderStatusesController = async (req, res, next) => {
+    try {
+        const orderedIds = req.body?.orderedIds;
+        const data = await statusService.reorderStatuses(
+            req.workspace,
+            orderedIds,
+            req.user?._id,
+        );
+        res.status(200).json({ success: true, data });
+    } catch (error) {
+        next(error);
+    }
+};
+
 // @route DELETE /api/workspaces/:id/statuses/:statusId
 // `reassignTo` is accepted in either the JSON body or as a query string
 // for clients that prefer plain `axios.delete(url)`.

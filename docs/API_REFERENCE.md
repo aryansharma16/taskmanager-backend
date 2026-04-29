@@ -19,6 +19,7 @@ Organisation                         (the tenant / company)
     └── Workspace  (project / team silo)
         ├── WorkspaceMember          (User × Workspace × workspace Role)
         ├── Status                   (Kanban column, e.g. "To Do")
+        │   └── order: Number        (left-to-right position on the board)
         └── Task                     (the card)
             ├── status      → Status         (which column)
             ├── parentTask  → Task           (subtasks; null = root)
@@ -32,11 +33,18 @@ Mental model:
 - A **User** logs in and picks an **Organisation** (tenant).
 - Inside the org they see one or more **Workspaces** they belong to.
 - A workspace defines its own **Statuses** (columns) — the board needs
-  at least one before tasks have somewhere to land.
+  at least one before tasks have somewhere to land. Each status has an
+  `order` that decides its left-to-right position on the board.
 - A **Task** belongs to a workspace, sits in a Status (or "no status"),
-  has an `order` for its position inside that column, may have a
-  `parentTask` (subtasks), and may have multiple **TaskAssignments**
-  (LEADER / ASSIGNEE / WATCHER per user).
+  has an `order` for its vertical position inside that column, may
+  have a `parentTask` (subtasks), and may have multiple
+  **TaskAssignments** (LEADER / ASSIGNEE / WATCHER per user).
+- Two independent drag-and-drop axes:
+  - **Cards (tasks)** drag up/down inside a column or across columns →
+    `PATCH /tasks/:taskId/move`.
+  - **Columns (statuses)** drag left/right across the board →
+    `PUT /statuses/reorder`.
+  - See §5.10 for the full FE interaction guide.
 
 ---
 
@@ -73,8 +81,12 @@ api.interceptors.request.use((config) => {
 { "success": true, "data": <payload>, "message"?: "..." }
 
 // Failure
-{ "success": false, "error": "<human readable>" }
+{ "success": false, "error": "<human readable>", "details"?: <object> }
 ```
+
+`details` is an optional structured payload some endpoints attach for
+self-diagnosis. Drag-and-drop is the main user — see §5.10 A.2 for
+the shape on `Sibling order is inconsistent` errors.
 
 | Status | Meaning                          | What the FE does                  |
 |--------|----------------------------------|------------------------------------|
@@ -296,33 +308,67 @@ A workspace **must have at least one Status** before its board renders
 real columns. If the FE shows "A board needs at least one status…",
 that's the empty-list state of `GET /statuses`.
 
+Each status carries an integer `order` field. Lower numbers render
+first (left → right on a Kanban board, top → bottom in a list view),
+so `order` is the source of truth for the **stage pipeline** — e.g.
+`To Do` (0) → `In Progress` (1) → `Done` (2). `order` is **not**
+required to be contiguous or unique; the backend only uses it as a
+sort key and falls back to `name` ASC for ties.
+
 | Method | URL | Perm | What it does |
 |---|---|---|---|
-| GET    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/statuses`                              | `read:task`     | List statuses, sorted by name. Add `?withTaskCounts=true` to get a `taskCount` per status (active tasks only). |
-| POST   | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/statuses`                              | `manage:status` | Create a status. |
+| GET    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/statuses`                              | `read:task`     | List statuses, sorted by `order` ASC then `name` ASC. Add `?withTaskCounts=true` to get a `taskCount` per status (active tasks only). |
+| POST   | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/statuses`                              | `manage:status` | Create a status. New statuses are appended to the end of the pipeline (`order = max + 1`) unless an explicit `order` is sent. |
 | GET    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/statuses/<statusId>`                   | `read:task`     | Fetch one status + active task count. |
-| PUT    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/statuses/<statusId>`                   | `manage:status` | Rename / re-color. |
+| PUT    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/statuses/<statusId>`                   | `manage:status` | Rename / re-color / nudge order. |
+| PUT    | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/statuses/reorder`                      | `manage:status` | **Bulk reorder** the whole pipeline (column drag-and-drop). |
 | DELETE | `{baseURL}/api/workspaces/69f0920eff6553f8b326fb92/statuses/<statusId>?reassignTo=<id>`   | `manage:status` | Delete. Blocked while any active task uses it; pass `reassignTo` to migrate. |
 
 **Create / update body:**
 ```json
-{ "name": "In Progress", "color": "#f59e0b" }
+{ "name": "In Progress", "color": "#f59e0b", "order": 1 }
 ```
 - `name` required, max 60 chars, **unique per workspace** (case-insensitive).
 - `color` optional hex (`#RGB` or `#RRGGBB`); defaults to `#cccccc`.
+- `order` optional non-negative integer. Omit it on create to append
+  to the end of the pipeline. On update, this is a "nudge" — it does
+  **not** renumber siblings. For drag-and-drop use `/reorder` instead.
 
 **List response (with `?withTaskCounts=true`):**
 ```json
 [
-  { "_id": "s1", "name": "To Do",       "color": "#94a3b8", "workspace": "...", "taskCount": 5 },
-  { "_id": "s2", "name": "In Progress", "color": "#f59e0b", "workspace": "...", "taskCount": 2 },
-  { "_id": "s3", "name": "Done",        "color": "#10b981", "workspace": "...", "taskCount": 12 }
+  { "_id": "s1", "name": "To Do",       "color": "#94a3b8", "order": 0, "workspace": "...", "taskCount": 5 },
+  { "_id": "s2", "name": "In Progress", "color": "#f59e0b", "order": 1, "workspace": "...", "taskCount": 2 },
+  { "_id": "s3", "name": "Done",        "color": "#10b981", "order": 2, "workspace": "...", "taskCount": 12 }
 ]
 ```
 
 **Get-by-id response:**
 ```json
-{ "status": { "_id": "s1", "name": "To Do", "color": "#94a3b8", "workspace": "..." }, "taskCount": 5 }
+{ "status": { "_id": "s1", "name": "To Do", "color": "#94a3b8", "order": 0, "workspace": "..." }, "taskCount": 5 }
+```
+
+**Reorder body** (`PUT /statuses/reorder`):
+```json
+{ "orderedIds": ["s3", "s1", "s2"] }
+```
+- Position in the array becomes the new `order` (`s3` → `0`, `s1` →
+  `1`, `s2` → `2`).
+- The array **must reference every status in the workspace exactly
+  once** — duplicates, missing ids, or ids from another workspace all
+  return `400`.
+- Returns the freshly-sorted full list, so the FE can replace its
+  column model in one go without an extra `GET /statuses` round trip:
+
+```json
+{
+  "success": true,
+  "data": [
+    { "_id": "s3", "name": "Done",        "order": 0, "..." : "..." },
+    { "_id": "s1", "name": "To Do",       "order": 1, "..." : "..." },
+    { "_id": "s2", "name": "In Progress", "order": 2, "..." : "..." }
+  ]
+}
 ```
 
 **Delete with reassignment**
@@ -455,13 +501,33 @@ to show archived rows.
 }
 ```
 
-**Move body** (drag-and-drop) — pass the sibling ids in the *target* column:
+**Move body** (drag-and-drop). Pick **one** of three drop-targeting
+styles — see §5.10 for which one to use when:
+
 ```json
+// Style 1 (RECOMMENDED) — 0-based index of the slot in the target column
 {
   "statusId":     "<statusId|null>",
   "parentTaskId": "<taskId|null>",
-  "beforeId":     "<task that should sit ABOVE the dropped task>",
-  "afterId":      "<task that should sit BELOW the dropped task>"
+  "position":     2
+}
+```
+
+```json
+// Style 2 — explicit neighbour ids (clearer naming)
+{
+  "statusId":   "<statusId|null>",
+  "prevTaskId": "<task that should sit ABOVE the dropped task>",
+  "nextTaskId": "<task that should sit BELOW the dropped task>"
+}
+```
+
+```json
+// Style 3 — same as style 2, legacy names
+{
+  "statusId": "<statusId|null>",
+  "beforeId": "<task that should sit ABOVE the dropped task>",
+  "afterId":  "<task that should sit BELOW the dropped task>"
 }
 ```
 
@@ -470,18 +536,46 @@ to show archived rows.
 > (create / update / move). The `Id`-suffixed names are the recommended
 > form because they read better when the value is an ObjectId; the bare
 > names are kept for backwards compat.
+>
+> **Style mixing:** `position` cannot be sent together with
+> `prevTaskId` / `nextTaskId` / `beforeId` / `afterId` — pick one or
+> the other. `prevTaskId` and `beforeId` are interchangeable (same
+> for `nextTaskId` / `afterId`); sending both with conflicting values
+> is a `400`.
 
-How `order` is computed:
+How `order` is computed for styles 2 & 3:
 
-| `beforeId` | `afterId` | New `order` |
+| `prevTaskId` (`beforeId`) | `nextTaskId` (`afterId`) | New `order` |
 |---|---|---|
-| yes | yes | `(before.order + after.order) / 2` |
-| yes | no  | `before.order + 1000` (drop at bottom) |
-| no  | yes | `after.order  - 1000` (drop at top)    |
+| yes | yes | `(prev.order + next.order) / 2` |
+| yes | no  | `prev.order + 1000` (drop at bottom) |
+| no  | yes | `next.order  - 1000` (drop at top)    |
 | no  | no  | append: `max(order in target column) + 1000` |
+
+For style 1 (`position`): the backend lists every other task in the
+target column (excluding the dragged one), sorts by `order`, and
+inserts the dragged task into slot `position` — averaging the two
+neighbours' orders, or extending the sequence if `position` falls at
+the start / end.
 
 If the column gets too dense the backend rebalances it to a clean
 1000-step sequence and recomputes — transparent to the FE.
+
+**Common bug → "200 OK but the card didn't move".** If your move
+request resolves to the task's *current* slot (same status + same
+order), the API now returns `400 Move did not change the task
+position…` instead of silently 200-ing. The fix is almost always one
+of:
+
+- `prevTaskId` / `nextTaskId` (or `beforeId` / `afterId`) **swapped**.
+  `prev` is the task that ends up ABOVE the dropped one; `next` is
+  the one that ends up BELOW.
+- A stale neighbour id from the source column after a cross-column
+  drop.
+- Nothing actually changed (user dropped the card back where it
+  came from). Detect this in the FE *before* firing the request.
+
+When in doubt, switch to `position` — it sidesteps all three.
 
 ---
 
@@ -524,6 +618,279 @@ automatically on every assignment mutation, so the
 
 ---
 
+### 5.10 Drag-and-drop interaction guide (FE)
+
+The board has **two independent drag axes**. They use different
+endpoints, different bodies, and different optimistic-update
+strategies. Here's the contract end-to-end.
+
+#### A. Dragging a task card (vertical or across columns)
+
+Endpoint:
+
+```http
+PATCH {baseURL}/api/workspaces/<wsId>/tasks/<taskId>/move
+```
+
+You can pick **one** of three styles for telling the backend where the
+card landed. Style A.1 is the simplest and is what most drag libraries
+hand you out of the box; reach for it first.
+
+##### A.1 By position index (recommended)
+
+```json
+{
+  "statusId": "<targetColumnId|null>",  // omit when same column
+  "position": 2                          // 0-based slot in the target column
+}
+```
+
+`position` is the **0-based index** of the slot the card should occupy
+in the target column **after** the move (the dragged card itself is
+excluded from the count). `0` = top, `1` = second from top, etc. Any
+number ≥ length-of-column appends to the bottom.
+
+Why prefer this over A.2 / A.3:
+
+- React-beautiful-dnd, @dnd-kit, dragula, and friends all give you a
+  `destination.index` directly — no neighbour hunting on the FE.
+- Cross-column drops "just work": `position` is computed against the
+  target column, not the source one.
+- It's impossible to accidentally swap "above" and "below".
+
+```javascript
+async function onTaskDragEnd({ task, destination }) {
+  const previous = boardState;
+  setBoardState(applyDragLocal(boardState, task.id, destination));
+
+  try {
+    const { data } = await api.patch(
+      `/api/workspaces/${wsId}/tasks/${task.id}/move`,
+      {
+        statusId: destination.columnId,   // omit if same column
+        position: destination.index,
+      },
+    );
+    setBoardState((s) => replaceTask(s, data));
+  } catch (err) {
+    setBoardState(previous);
+    const msg = err.response?.data?.error ?? 'Could not move task';
+    if (msg.includes('inconsistent') || msg.includes('did not change')) {
+      await reloadBoard();
+    } else {
+      toast.error(msg);
+    }
+  }
+}
+```
+
+##### A.2 By neighbour ids (`prevTaskId` / `nextTaskId`)
+
+Use this when your drag library reports neighbour cards instead of an
+index, or when the FE wants to be explicit:
+
+```json
+{
+  "statusId":   "<targetColumnId|null>",
+  "prevTaskId": "<sibling that ends up immediately ABOVE>",
+  "nextTaskId": "<sibling that ends up immediately BELOW>"
+}
+```
+
+Pick the right combination:
+
+| Drop location in target column | Send |
+|---|---|
+| Top of column | only `nextTaskId` |
+| Bottom of column | only `prevTaskId` |
+| Between two cards | both |
+| Empty column | neither (the card is appended) |
+
+> **The most common bug here is swapping the two ids.** If you drag a
+> card UP, the card it lands above is the `nextTaskId` (it's now BELOW
+> the dropped one), **not** the `prevTaskId`. Getting this wrong used
+> to silently 200 with `order` unchanged; the API now returns
+> `400 Move did not change the task position…` so the bug surfaces
+> immediately. If you keep tripping over this, switch to A.1.
+
+> **The board must render columns sorted by `order` ASC** for
+> `prevTaskId` / `nextTaskId` to mean what you think. If the FE
+> sorts by title / `createdAt` / drag-and-drop temp state instead,
+> the visible "above/below" no longer matches the DB neighbours,
+> and the ids you pick will be flipped relative to actual `order`.
+> Symptom: you get `400 Sibling order is inconsistent — …` even
+> though the request looks right.
+
+When the request would land "between" two cards but the prev/next
+pair isn't in `order` ASC, the API responds:
+
+```json
+{
+  "success": false,
+  "error": "Sibling order is inconsistent — `prevTaskId` (<id>, order 3000) must have a smaller `order` than `nextTaskId` (<id>, order 2000), but the opposite is true. Most likely the FE swapped the two ids, or the board is rendering tasks in a different sort than `order` ASC. Refresh the board, or switch to `position` (0-based index) instead of neighbour ids — see API_REFERENCE §5.10.",
+  "details": {
+    "prevTaskId": "<id>",
+    "prevOrder": 3000,
+    "nextTaskId": "<id>",
+    "nextOrder": 2000
+  }
+}
+```
+
+The numbers in `details` tell you exactly which side is "wrong" —
+read them in dev tools and you can usually point at the bug in a
+few seconds (e.g. `prevOrder > nextOrder` ⇒ ids are flipped).
+
+##### A.3 By neighbour ids (`beforeId` / `afterId`, legacy)
+
+Identical to A.2 with older field names. `beforeId` ≡ `prevTaskId`,
+`afterId` ≡ `nextTaskId`. Kept for backwards compat — new code should
+prefer A.1 or A.2.
+
+##### Common rules (all three styles)
+
+- `statusId` is **required only when the column changed**. Omit it
+  (or send `null` for the no-status bucket) when dragging within the
+  same column.
+- The neighbour ids **must already be in the target column** — if
+  you send a stale id from the source column, the backend returns
+  `400 Sibling task is in a different column`.
+- Never reference the dragged task itself in
+  `prevTaskId`/`beforeId`/`nextTaskId`/`afterId` — rejected with `400`.
+- Don't mix `position` with neighbour ids in the same request — `400`.
+- `parentTaskId` is only used when the FE supports re-parenting via
+  drag (e.g. dropping into a subtask zone); leave it out otherwise.
+
+How `order` is computed for A.2 / A.3:
+
+| `prevTaskId` (`beforeId`) | `nextTaskId` (`afterId`) | New `order` |
+|---|---|---|
+| yes | yes | `(prev.order + next.order) / 2` |
+| yes | no  | `prev.order + 1000` (drop at bottom) |
+| no  | yes | `next.order  - 1000` (drop at top)    |
+| no  | no  | append: `max(order in target column) + 1000` |
+
+If the column gets too dense the backend rebalances it to a clean
+1000-step sequence and recomputes — transparent to the FE.
+
+Response (200) — same shape regardless of which style you sent:
+
+```json
+{
+  "success": true,
+  "data": {
+    "_id": "<taskId>",
+    "title": "...",
+    "status": "<targetColumnId>",
+    "order": 1500,
+    "..." : "..."
+  }
+}
+```
+
+#### B. Dragging a status column (horizontal pipeline reorder)
+
+Endpoint:
+
+```http
+PUT {baseURL}/api/workspaces/<wsId>/statuses/reorder
+```
+
+Body — the **full** new column order, every status id exactly once,
+in the order you want them rendered:
+
+```json
+{ "orderedIds": ["<statusId>", "<statusId>", "<statusId>"] }
+```
+
+Why "every id exactly once"?
+
+- The endpoint atomically rewrites every column's `order` to its array
+  index (`0..n-1`). Sending a partial list would silently leave
+  un-touched columns at their old `order`, which would mix old and
+  new positions on the next render. The backend rejects partial input
+  with `400 orderedIds must reference every status in the workspace
+  exactly once`.
+
+Recommended FE flow (optimistic):
+
+```javascript
+async function onStatusDragEnd(newColumns) {
+  const previous = columns;
+
+  // 1. Optimistic: render the new column order immediately.
+  setColumns(newColumns);
+
+  try {
+    const { data } = await api.put(
+      `/api/workspaces/${wsId}/statuses/reorder`,
+      { orderedIds: newColumns.map((c) => c._id) },
+    );
+    // 2. Replace with the server-canonical list (which now carries
+    //    the freshly-assigned `order: 0..n-1` values).
+    setColumns(data);
+  } catch (err) {
+    setColumns(previous);
+    toast.error(err.response?.data?.error ?? 'Could not reorder columns');
+  }
+}
+```
+
+Response (200) — the freshly-sorted list, ready to bind to your
+column model without a follow-up `GET`:
+
+```json
+{
+  "success": true,
+  "data": [
+    { "_id": "s3", "name": "Done",        "order": 0, "..." : "..." },
+    { "_id": "s1", "name": "To Do",       "order": 1, "..." : "..." },
+    { "_id": "s2", "name": "In Progress", "order": 2, "..." : "..." }
+  ]
+}
+```
+
+#### C. Permissions to gate the UI
+
+| Action | Required perm | Hide / disable when missing |
+|---|---|---|
+| Drag a task card | `update:task` | Lock cards (e.g. `pointer-events: none`) and skip the drag-handle. |
+| Drag a status column | `manage:status` | Hide the column drag handle; the "+ Add status", rename, color, and delete affordances should hide too. |
+| Create a task in a column | `create:task` | Hide the "+ Add a task" footer in each column. |
+| Add an assignee | `assign:task` | Hide the "+ assignee" button on the task detail panel. |
+
+Use the `can(perm)` helper from §4 — it already folds the org-level
+`*` and `manage:workspace` bypasses in.
+
+#### D. Recommended initial board load
+
+Two parallel calls, then render:
+
+```javascript
+const [statusesRes, boardRes] = await Promise.all([
+  api.get(`/api/workspaces/${wsId}/statuses?withTaskCounts=true`),
+  api.get(`/api/workspaces/${wsId}/tasks/board`),
+]);
+const columns = statusesRes.data.data;            // ← already sorted by `order`
+const board   = boardRes.data.data;               // ← columns also in `order` ASC
+```
+
+Both endpoints return columns in the same `order` ASC sequence, so
+you can zip / merge them by `_id` without re-sorting on the FE.
+
+#### E. Empty / edge states
+
+- **Empty board:** if `GET /statuses` returns `[]`, render the
+  "Configure statuses" CTA. There's no "no status" column until a
+  task without a status exists.
+- **Status deleted while user was dragging it:** the next mutation
+  returns `404 Status not found` — refetch and re-render.
+- **Workspace archived mid-session:** every status / task mutation
+  returns `400 Workspace is archived. Restore it before performing
+  this action.` — surface a single banner, not per-action toasts.
+
+---
+
 ## 6. Common error messages
 
 | Where | Status | Message |
@@ -533,9 +900,19 @@ automatically on every assignment mutation, so the
 | Workspace | 400 | `Workspace is archived. Restore it before performing this action.` |
 | Status | 400 | `A status with this name already exists in this workspace` |
 | Status | 400 | `Cannot delete status: N active task(s) still use it. Pass reassignTo to migrate them.` |
+| Status | 400 | `order must be a non-negative integer` (create / update / single-status nudge) |
+| Status | 400 | `orderedIds must be a non-empty array` (reorder) |
+| Status | 400 | `orderedIds contains duplicates` (reorder) |
+| Status | 400 | `orderedIds must reference every status in the workspace exactly once` (reorder; missing or extra ids) |
+| Status | 400 | `Status <id> does not belong to this workspace` (reorder) |
 | Task | 400 | `Status does not belong to this workspace` |
 | Task | 400 | `A task cannot be its own parent` / `would create a cycle` |
-| Task | 400 | `Sibling order is inconsistent — the board may be stale, please refresh` (drag-and-drop) |
+| Task | 400 | `Sibling order is inconsistent — \`prevTaskId\` (…, order N) must have a smaller \`order\` than \`nextTaskId\` (…, order M) …` (drag-and-drop; response carries a `details` object with the observed orders — see §5.10 A.2) |
+| Task | 400 | `Sibling task is in a different column` (drag-and-drop with stale `prevTaskId`/`nextTaskId`) |
+| Task | 400 | `Move did not change the task position…` (FE swapped `prev`/`next` or sent a stale neighbour — see §5.10 A.2) |
+| Task | 400 | `position must be a non-negative integer` (drag-and-drop, style A.1) |
+| Task | 400 | `Send either `position` OR `beforeId`/`afterId` — not both` (drag-and-drop, mixed styles) |
+| Task | 400 | `beforeId and prevTaskId conflict — send only one` / `afterId and nextTaskId conflict — send only one` |
 | Task | 400 | `Task is archived. Restore it before editing.` |
 | Assignment | 400 | `User <id> is not an active member of this workspace` |
 | Assignment | 409 | `Duplicate value for task, user, role` |
@@ -556,9 +933,12 @@ A typical flow for the Kanban screen, end to end:
    b. Load tasks          → GET  {baseURL}/api/workspaces/<wsId>/tasks/board
 5. Open task details      → GET  {baseURL}/api/workspaces/<wsId>/tasks/<taskId>
 6. Add an assignee        → POST {baseURL}/api/workspaces/<wsId>/tasks/<taskId>/assignments
-7. Drag card to column B  → PATCH {baseURL}/api/workspaces/<wsId>/tasks/<taskId>/move
+7. Drag card up/down or
+   between columns        → PATCH {baseURL}/api/workspaces/<wsId>/tasks/<taskId>/move
                             { "statusId": "<columnB>", "beforeId": "...", "afterId": "..." }
-8. Archive task           → DELETE {baseURL}/api/workspaces/<wsId>/tasks/<taskId>
+8. Drag a column          → PUT   {baseURL}/api/workspaces/<wsId>/statuses/reorder
+   left/right               { "orderedIds": ["<s3>", "<s1>", "<s2>"] }
+9. Archive task           → DELETE {baseURL}/api/workspaces/<wsId>/tasks/<taskId>
 ```
 
 What's bound to what at each step:
@@ -569,8 +949,12 @@ What's bound to what at each step:
   the user against it).
 - The task's `status` field selects which **Status** column it lives
   in. `null` = the leading "no status" bucket.
-- The task's `order` field decides its vertical position inside that
-  column. `/move` is the only endpoint you need for drag-and-drop —
-  pass `beforeId` / `afterId` based on what you dropped between.
+- The status's `order` field decides the **column's left-to-right
+  position** on the board. `/statuses/reorder` is the only endpoint
+  you need for column drag — pass the full `orderedIds` array.
+- The task's `order` field decides its **vertical position inside
+  that column**. `/tasks/<taskId>/move` is the only endpoint you need
+  for card drag — pass `beforeId` / `afterId` based on what you
+  dropped between.
 - `TaskAssignment` rows (LEADER / ASSIGNEE / WATCHER) hang off a task;
   the `Task.assignees` array stays in sync automatically.

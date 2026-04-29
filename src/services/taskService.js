@@ -176,6 +176,10 @@ const rebalanceColumn = async (workspaceId, statusId) => {
 // column. `beforeId` is the task that should sit immediately ABOVE the
 // dropped task (smaller `order`); `afterId` is the one immediately
 // BELOW (larger `order`). Either / both / neither may be passed.
+//
+// `excludeId` is the task being moved — it's filtered out of the
+// "is the column collapsed?" check so an in-column drag doesn't
+// trigger an unnecessary rebalance against itself.
 const computeMoveOrder = async (workspaceId, statusId, beforeId, afterId) => {
     const lookup = async (id) => {
         if (!id) return null;
@@ -202,9 +206,30 @@ const computeMoveOrder = async (workspaceId, statusId, beforeId, afterId) => {
 
     if (before && after) {
         if (before.order >= after.order) {
-            throw new Error(
-                'Sibling order is inconsistent — the board may be stale, please refresh'
+            // Including the observed orders here turns this from a
+            // mystery into a self-diagnosing error: the FE dev
+            // immediately sees whether the prev/next pair is swapped
+            // (most common cause) or whether their column rendering
+            // doesn't actually match `order` ASC (the other cause).
+            const err = new Error(
+                'Sibling order is inconsistent — `prevTaskId` ' +
+                `(${before._id}, order ${before.order}) must have a ` +
+                'smaller `order` than `nextTaskId` ' +
+                `(${after._id}, order ${after.order}), but the ` +
+                'opposite is true. Most likely the FE swapped the two ' +
+                'ids, or the board is rendering tasks in a different ' +
+                'sort than `order` ASC. Refresh the board, or switch ' +
+                'to `position` (0-based index) instead of neighbour ' +
+                'ids — see API_REFERENCE §5.10.'
             );
+            err.statusCode = 400;
+            err.details = {
+                prevTaskId: before._id.toString(),
+                prevOrder: before.order,
+                nextTaskId: after._id.toString(),
+                nextOrder: after.order,
+            };
+            throw err;
         }
         const next = (before.order + after.order) / 2;
         const collapsed =
@@ -220,6 +245,63 @@ const computeMoveOrder = async (workspaceId, statusId, beforeId, afterId) => {
     if (before) return before.order + ORDER_STEP;
     if (after) return after.order - ORDER_STEP;
     return computeAppendOrder(workspaceId, statusId);
+};
+
+// Resolve the new `order` value from a **0-based index** in the target
+// column. This is the FE-friendly path: most drag libraries
+// (react-beautiful-dnd, @dnd-kit, dragula…) already hand you a
+// destination index, so the FE never has to figure out which sibling
+// is "before" vs "after" the drop — a frequent source of bugs.
+//
+// `movingTaskId` is excluded from the column listing so the index is
+// computed against the **post-drop** sibling array (i.e. position `0`
+// always means "top of column", regardless of where the dragged task
+// sat before).
+//
+// Edge cases:
+//   - empty column           → append at ORDER_STEP
+//   - position <= 0          → above the current top
+//   - position >= length     → below the current bottom (append)
+//   - in between             → average of the two neighbours
+const computeOrderForPosition = async (
+    workspaceId,
+    statusId,
+    position,
+    movingTaskId,
+) => {
+    if (!Number.isInteger(position) || position < 0) {
+        throw new Error('position must be a non-negative integer');
+    }
+
+    const filter = columnFilter(workspaceId, statusId);
+    if (movingTaskId) filter._id = { $ne: movingTaskId };
+
+    const siblings = await Task.find(filter)
+        .sort({ order: 1, _id: 1 })
+        .select('_id order');
+
+    if (siblings.length === 0) return ORDER_STEP;
+    if (position <= 0) return siblings[0].order - ORDER_STEP;
+    if (position >= siblings.length) {
+        return siblings[siblings.length - 1].order + ORDER_STEP;
+    }
+
+    const before = siblings[position - 1];
+    const after = siblings[position];
+    const next = (before.order + after.order) / 2;
+    const collapsed =
+        Math.abs(next - before.order) < MIN_ORDER_GAP ||
+        Math.abs(after.order - next) < MIN_ORDER_GAP;
+    if (collapsed) {
+        await rebalanceColumn(workspaceId, statusId);
+        return computeOrderForPosition(
+            workspaceId,
+            statusId,
+            position,
+            movingTaskId,
+        );
+    }
+    return next;
 };
 
 // The denormalised `assignees` array on Task is purely for fast filter
@@ -439,6 +521,7 @@ export const getBoard = async (
     { includeArchived = false, rootOnly = true } = {}
 ) => {
     const statuses = await Status.find({ workspace: workspace._id }).sort({
+        order: 1,
         name: 1,
     });
 
@@ -622,8 +705,28 @@ export const updateTask = async (workspace, taskId, patch, actorId) => {
 
 // Drag-and-drop endpoint. Atomically updates `status` (column) and
 // `order` (position within column), with optional re-parenting.
-// Caller passes either `beforeId` and/or `afterId` (sibling task ids
-// in the *target* column) — see computeMoveOrder for the maths.
+//
+// The caller picks ONE of three drop-targeting styles:
+//
+//   1. `position` — 0-based index of the slot the card should occupy
+//      in the target column AFTER the move (excluding the dragged
+//      task itself). This is the FE-friendly form most drag libs
+//      already produce. Recommended.
+//
+//   2. `prevTaskId` / `nextTaskId` — explicit neighbour ids. These
+//      are aliases for the lower-level `beforeId` / `afterId`. Same
+//      semantics:
+//        - `prevTaskId` / `beforeId`  = sibling that ends up ABOVE.
+//        - `nextTaskId`  / `afterId`  = sibling that ends up BELOW.
+//
+//   3. Nothing → the task is appended to the bottom of the target
+//      column (handy for "drop into empty column" cases).
+//
+// If the chosen inputs would resolve to the task's *current* slot
+// (same status + same order bucket) we surface a friendly
+// `400 Move did not change the task position…` instead of silently
+// returning 200, because that's almost always a FE bug — typically
+// `prevTaskId`/`nextTaskId` swapped, or a stale neighbour id.
 export const moveTask = async (workspace, taskId, payload, actorId) => {
     if (!isObjectId(taskId)) throw new Error('Invalid task id');
     const task = await Task.findOne({
@@ -655,21 +758,75 @@ export const moveTask = async (workspace, taskId, payload, actorId) => {
         }
     }
 
-    const beforeId = payload.beforeId || null;
-    const afterId = payload.afterId || null;
+    // Accept the legacy / lower-level names AND the friendlier
+    // aliases. Throwing on conflicting payloads is kinder than
+    // silently picking one — saves a bug-hunt later.
+    const beforeId = payload.beforeId ?? payload.prevTaskId ?? null;
+    const afterId = payload.afterId ?? payload.nextTaskId ?? null;
+    if (
+        payload.beforeId !== undefined &&
+        payload.prevTaskId !== undefined &&
+        payload.beforeId !== payload.prevTaskId
+    ) {
+        throw new Error('beforeId and prevTaskId conflict — send only one');
+    }
+    if (
+        payload.afterId !== undefined &&
+        payload.nextTaskId !== undefined &&
+        payload.afterId !== payload.nextTaskId
+    ) {
+        throw new Error('afterId and nextTaskId conflict — send only one');
+    }
+    const positionRaw = payload.position;
+    const hasPosition = positionRaw !== undefined && positionRaw !== null;
+
+    if (hasPosition && (beforeId || afterId)) {
+        throw new Error(
+            'Send either `position` OR `beforeId`/`afterId` — not both',
+        );
+    }
     if (beforeId && beforeId.toString() === task._id.toString()) {
-        throw new Error('beforeId cannot reference the task itself');
+        throw new Error('beforeId/prevTaskId cannot reference the task itself');
     }
     if (afterId && afterId.toString() === task._id.toString()) {
-        throw new Error('afterId cannot reference the task itself');
+        throw new Error('afterId/nextTaskId cannot reference the task itself');
     }
 
-    const nextOrder = await computeMoveOrder(
-        workspace._id,
-        nextStatusId,
-        beforeId,
-        afterId
-    );
+    let nextOrder;
+    if (hasPosition) {
+        const positionNum =
+            typeof positionRaw === 'number' ? positionRaw : Number(positionRaw);
+        nextOrder = await computeOrderForPosition(
+            workspace._id,
+            nextStatusId,
+            positionNum,
+            task._id,
+        );
+    } else {
+        nextOrder = await computeMoveOrder(
+            workspace._id,
+            nextStatusId,
+            beforeId,
+            afterId,
+        );
+    }
+
+    const sameColumn =
+        (nextStatusId || null) ===
+        (task.status ? task.status.toString() : null);
+    const sameSlot = sameColumn && nextOrder === task.order;
+    if (sameSlot) {
+        // Most likely the FE swapped beforeId/afterId (or
+        // prevTaskId/nextTaskId), or used an outdated index.
+        // Bail loudly so the bug surfaces during development
+        // instead of looking like a flaky UI.
+        throw new Error(
+            'Move did not change the task position. Check that ' +
+            '`prevTaskId` (task that should sit ABOVE) and `nextTaskId` ' +
+            '(task that should sit BELOW) are not swapped, or use ' +
+            '`position` (0-based index in the target column) instead.',
+        );
+    }
 
     task.status = nextStatusId || undefined;
     task.order = nextOrder;
@@ -687,6 +844,7 @@ export const moveTask = async (workspace, taskId, payload, actorId) => {
             after: pickTaskFields(task.toObject()),
             beforeId,
             afterId,
+            position: hasPosition ? Number(positionRaw) : undefined,
         },
     });
 

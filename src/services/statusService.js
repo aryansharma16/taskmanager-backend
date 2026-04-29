@@ -35,6 +35,31 @@ const normaliseColor = (raw) => {
     return raw.trim().toLowerCase();
 };
 
+// Order is a stable sort key for the pipeline ("Todo" < "In Progress" <
+// "Done"). We accept any finite, non-negative integer — the value is
+// deliberately just a sort hint, not a slot number, so callers don't
+// have to worry about gaps. `null`/`undefined` means "no preference"
+// and lets `createStatus` auto-pick `max+1`.
+const normaliseOrder = (raw) => {
+    if (raw === undefined || raw === null || raw === '') return undefined;
+    const n = typeof raw === 'number' ? raw : Number(raw);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
+        throw new Error('order must be a non-negative integer');
+    }
+    return n;
+};
+
+// Find the next free `order` value for a workspace. Used when a status
+// is created without an explicit order so it lands at the end of the
+// pipeline rather than colliding with the default `0`.
+const nextOrderFor = async (workspaceId) => {
+    const last = await Status.findOne({ workspace: workspaceId })
+        .sort({ order: -1 })
+        .select('order')
+        .lean();
+    return last ? (last.order ?? 0) + 1 : 0;
+};
+
 // Resolve `:statusId` to a Status row that lives in the given workspace.
 // We fold the workspace boundary into the query (instead of fetching and
 // then comparing) so cross-tenant probes return 404 with no extra round
@@ -51,6 +76,7 @@ const findStatusInWorkspace = async (workspaceId, statusId) => {
 export const createStatus = async (workspace, payload, actorId) => {
     const name = normaliseName(payload?.name);
     const color = normaliseColor(payload?.color);
+    const explicitOrder = normaliseOrder(payload?.order);
 
     // Pre-flight uniqueness check so we can surface a friendly error
     // before hitting the unique compound index. The index is still the
@@ -63,9 +89,19 @@ export const createStatus = async (workspace, payload, actorId) => {
         throw new Error('A status with this name already exists in this workspace');
     }
 
+    // If the caller didn't pin an order, append to the end of the
+    // pipeline. Two concurrent creates can land on the same `order`,
+    // which is fine — `name` is the secondary sort key and clients
+    // can call `reorderStatuses` to compact later.
+    const order =
+        explicitOrder !== undefined
+            ? explicitOrder
+            : await nextOrderFor(workspace._id);
+
     const status = await Status.create({
         name,
         color: color || undefined,
+        order,
         workspace: workspace._id,
     });
 
@@ -79,22 +115,26 @@ export const createStatus = async (workspace, payload, actorId) => {
         metadata: {
             name: status.name,
             color: status.color,
+            order: status.order,
         },
     });
 
     return status;
 };
 
-// List statuses for a workspace. By default sorts by name ASC to match
-// `getBoard`. When `withTaskCounts` is set, each row is enriched with
-// the number of *active* tasks pointing at it — useful for rendering
-// column counts in the configuration UI without fetching the full board.
+// List statuses for a workspace. Sorted by pipeline `order` ASC (with
+// `name` as a stable tiebreaker for ties / legacy rows that all share
+// the default `0`) so the configuration UI and `getBoard` agree on
+// column order. When `withTaskCounts` is set, each row is enriched
+// with the number of *active* tasks pointing at it — useful for
+// rendering column counts in the configuration UI without fetching
+// the full board.
 export const listStatuses = async (
     workspace,
     { withTaskCounts = false } = {},
 ) => {
     const statuses = await Status.find({ workspace: workspace._id })
-        .sort({ name: 1 })
+        .sort({ order: 1, name: 1 })
         .lean();
 
     if (!withTaskCounts || statuses.length === 0) {
@@ -137,7 +177,11 @@ export const updateStatus = async (workspace, statusId, patch, actorId) => {
     const status = await findStatusInWorkspace(workspace._id, statusId);
     if (!status) throw new Error('Status not found');
 
-    const before = { name: status.name, color: status.color };
+    const before = {
+        name: status.name,
+        color: status.color,
+        order: status.order,
+    };
 
     if (patch.name !== undefined) {
         const next = normaliseName(patch.name);
@@ -160,6 +204,17 @@ export const updateStatus = async (workspace, statusId, patch, actorId) => {
     if (patch.color !== undefined) {
         status.color = normaliseColor(patch.color) || '#cccccc';
     }
+    // Single-status order updates are a quick "nudge" — they don't
+    // renumber siblings. For drag-and-drop rearranges that need the
+    // whole pipeline updated atomically, callers should use
+    // `reorderStatuses` instead.
+    if (patch.order !== undefined) {
+        const nextOrder = normaliseOrder(patch.order);
+        if (nextOrder === undefined) {
+            throw new Error('order must be a non-negative integer');
+        }
+        status.order = nextOrder;
+    }
 
     await status.save();
 
@@ -172,11 +227,81 @@ export const updateStatus = async (workspace, statusId, patch, actorId) => {
         performedBy: actorId,
         metadata: {
             before,
-            after: { name: status.name, color: status.color },
+            after: {
+                name: status.name,
+                color: status.color,
+                order: status.order,
+            },
         },
     });
 
     return status;
+};
+
+// Bulk-reorder the pipeline. Accepts an ordered array of status ids;
+// position in the array becomes the new `order` value. Validates that
+// every id belongs to the workspace and that the array covers the full
+// set of statuses (no missing or extra ids), so the resulting
+// `0..n-1` numbering is gap-free and unambiguous.
+//
+// We use an unordered `bulkWrite` so all the writes ship in a single
+// round trip. If any write fails, MongoDB still applies the others —
+// callers can re-issue the operation safely because the inputs are
+// idempotent (the same ids map to the same indices).
+export const reorderStatuses = async (workspace, orderedIds, actorId) => {
+    if (!Array.isArray(orderedIds) || orderedIds.length === 0) {
+        throw new Error('orderedIds must be a non-empty array');
+    }
+    for (const id of orderedIds) {
+        if (!isObjectId(id)) throw new Error('Invalid status id in orderedIds');
+    }
+
+    const seen = new Set(orderedIds.map(String));
+    if (seen.size !== orderedIds.length) {
+        throw new Error('orderedIds contains duplicates');
+    }
+
+    const existing = await Status.find({ workspace: workspace._id })
+        .select('_id order name')
+        .lean();
+    const existingIds = new Set(existing.map((s) => s._id.toString()));
+
+    if (existing.length !== seen.size) {
+        throw new Error(
+            'orderedIds must reference every status in the workspace exactly once',
+        );
+    }
+    for (const id of seen) {
+        if (!existingIds.has(id)) {
+            throw new Error(
+                `Status ${id} does not belong to this workspace`,
+            );
+        }
+    }
+
+    const ops = orderedIds.map((id, index) => ({
+        updateOne: {
+            filter: { _id: id, workspace: workspace._id },
+            update: { $set: { order: index } },
+        },
+    }));
+    await Status.bulkWrite(ops, { ordered: false });
+
+    await logActivity({
+        entityType: 'Workspace',
+        entityId: workspace._id,
+        organisation: workspace.organisation,
+        workspace: workspace._id,
+        action: 'statuses_reordered',
+        performedBy: actorId,
+        metadata: {
+            order: orderedIds.map(String),
+        },
+    });
+
+    return Status.find({ workspace: workspace._id })
+        .sort({ order: 1, name: 1 })
+        .lean();
 };
 
 // Delete a status. Tasks reference Status by ObjectId without a foreign
